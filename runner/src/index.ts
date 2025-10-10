@@ -84,7 +84,7 @@ const triggerAlertEscalation = Cadenza.createRoutine(
 ).doOn("health.alert_escalation");
 
 // Scheduler Task: Runs periodically to mock events and trigger flows
-const schedulerTask = Cadenza.createMetaTask(
+const schedulerTask = Cadenza.createTask(
   'RunMockScheduler',
   async (ctx: any, emit: any) => {
     const trafficMode = process.env.TRAFFIC_MODE || 'low';
@@ -159,11 +159,11 @@ const schedulerTask = Cadenza.createMetaTask(
       });
     }
 
-    console.log(`Scheduler tick: Mocked event for ${deviceId} in ${trafficMode} mode (anomaly: ${anomalyFlag ? 'yes (' + anomalyReason + ')' : 'no'})`);
+    console.log(`Scheduler tick: Mocked event for ${deviceId} (anomaly: ${anomalyFlag ? 'yes (' + anomalyReason + ')' : 'no'})`);
     return { success: true, eventsGenerated: 1 };
   },
   'Runs the mock scheduler to generate events and trigger flows'
-).doOn("meta.cron.started");
+).doOn("tick.started");
 
 // Cadenza Service Setup
 Cadenza.createCadenzaService('ScheduledRunnerService', 'Mocks IoT device events and triggers monitoring flows', {
@@ -178,17 +178,30 @@ Cadenza.createCadenzaService('ScheduledRunnerService', 'Mocks IoT device events 
 setTimeout(() => {
   // @ts-ignore
   process.emit('cadenza-ready');
-}, 10000);  // Adjust delay based on init time
+}, 15000);  // Adjust delay based on init time
 
 // Start the cron scheduler after Cadenza initializes
 process.on('cadenza-ready', () => {
-  Cadenza.broker.emit("meta.cron.started", {});
-  const cronPattern = process.env.TRAFFIC_MODE === 'high' ? '*/1 * * * *' : '*/5 * * * *'; // Every 1 min (high) or 5 min (low)
-  const job = new cron.CronJob(cronPattern, async () => {
-    Cadenza.broker.emit("meta.cron.started", {});
-  }, null, true, 'UTC');
+  console.log('Cadenza ready—starting dynamic traffic simulator');
 
-  console.log(`Scheduler started in ${process.env.TRAFFIC_MODE} mode with pattern ${cronPattern}`);
+  const simulateTick = async () => {
+    // Emit signal to trigger the mock scheduler task
+    Cadenza.broker.emit("tick.started", {});
+
+    // Compute next delay based on mode
+    const minDelay = 1000;
+    const maxDelay = 300000;
+
+    const nextDelay = minDelay + Math.random() * (maxDelay - minDelay);
+
+    console.log(`Dynamic tick complete. Next tick in ${(nextDelay / 1000).toFixed(0)} seconds.`);
+
+    // Schedule next tick
+    setTimeout(simulateTick, nextDelay);
+  };
+
+  // Start the first tick immediately
+  simulateTick();
 });
 
 console.log('Listening for cadenza-ready event');

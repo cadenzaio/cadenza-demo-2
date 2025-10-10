@@ -4,7 +4,7 @@ const validateTask = Cadenza.createTask(
     'ValidateTelemetry',
     (ctx: any, emit: any) => {
       // Basic validation (e.g., required fields, range checks)
-      if (!ctx.deviceId || !ctx.readings || typeof ctx.readings.temperature !== 'number') {
+      if (!ctx.deviceId || !ctx.telemetry || typeof ctx.telemetry.readings?.temperature !== 'number') {
         throw new Error('Invalid telemetry data');
       }
       // Emit local signal for validation status
@@ -17,12 +17,13 @@ const validateTask = Cadenza.createTask(
     Cadenza.createTask(
       'FilterOutliers',
       (ctx: any, emit: any) => {
+        const telemetry = ctx.telemetry;
         // Simple outlier filtering (e.g., >3 std devs from mean; mock mean=50 for demo)
-        const tempZScore = Math.abs(ctx.readings.temperature - 50) / 20; // Mock std dev=20
+        const tempZScore = Math.abs(telemetry.readings.temperature - 50) / 20; // Mock std dev=20
         if (tempZScore > 3) {
           ctx.filtered = false;
           emit('telemetry.outlier_detected', { deviceId: ctx.deviceId, metric: 'temperature' });
-          console.log(`Filtered outlier for device ${ctx.deviceId}: temp=${ctx.readings.temperature}`);
+          console.log(`Filtered outlier for device ${ctx.deviceId}: temp=${telemetry.readings.temperature}`);
           return { ...ctx, filtered: false };
         }
         ctx.filtered = true;
