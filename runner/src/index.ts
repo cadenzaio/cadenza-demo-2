@@ -1,6 +1,5 @@
 import Cadenza from '@cadenza.io/service';
 import { mockTelemetryEvent } from './scheduler.js';
-import cron from 'cron';
 
 // Cadenza Routine: Mock Telemetry Ingestion
 // This routine is triggered by signals from the scheduler and mocks a device event
@@ -20,7 +19,7 @@ Cadenza.createRoutine(
 
 // Cadenza Routine: Trigger Health Check Flow
 // Emits a signal to trigger the Health Check routine in Telemetry Collector
-const triggerHealthCheck = Cadenza.createRoutine(
+Cadenza.createRoutine(
   'TriggerHealthCheck',
   [
     Cadenza.createTask(
@@ -42,7 +41,7 @@ const triggerHealthCheck = Cadenza.createRoutine(
 
 // Cadenza Routine: Trigger Predictive Maintenance Flow
 // Emits a signal to trigger Predictive Maintenance in Predictor Service
-const triggerPredictiveMaintenance = Cadenza.createRoutine(
+Cadenza.createRoutine(
   'TriggerPredictiveMaintenance',
   [
     Cadenza.createTask(
@@ -63,7 +62,7 @@ const triggerPredictiveMaintenance = Cadenza.createRoutine(
 
 // Cadenza Routine: Trigger Alert Escalation Flow
 // Emitted reactively by signals from other services
-const triggerAlertEscalation = Cadenza.createRoutine(
+Cadenza.createRoutine(
   'TriggerAlertEscalation',
   [
     Cadenza.createTask(
@@ -84,7 +83,7 @@ const triggerAlertEscalation = Cadenza.createRoutine(
 ).doOn("health.alert_escalation");
 
 // Scheduler Task: Runs periodically to mock events and trigger flows
-const schedulerTask = Cadenza.createTask(
+Cadenza.createTask(
   'RunMockScheduler',
   async (ctx: any, emit: any) => {
     const trafficMode = process.env.TRAFFIC_MODE || 'low';
@@ -188,9 +187,8 @@ process.on('cadenza-ready', () => {
     // Emit signal to trigger the mock scheduler task
     Cadenza.broker.emit("tick.started", {});
 
-    // Compute next delay based on mode
     const minDelay = 1000;
-    const maxDelay = 300000;
+    const maxDelay = 200000;
 
     const nextDelay = minDelay + Math.random() * (maxDelay - minDelay);
 
