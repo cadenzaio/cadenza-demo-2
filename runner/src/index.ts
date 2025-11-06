@@ -177,7 +177,7 @@ Cadenza.createCadenzaService('ScheduledRunnerService', 'Mocks IoT device events 
 setTimeout(() => {
   // @ts-ignore
   process.emit('cadenza-ready');
-}, 15000);  // Adjust delay based on init time
+}, 60000);  // Adjust delay based on init time
 
 // Start the cron scheduler after Cadenza initializes
 process.on('cadenza-ready', () => {
