@@ -30,7 +30,7 @@ Cadenza.createRoutine(
           deviceId: ctx.deviceId,
           triggerType: 'scheduled',
         });
-        console.log(`Emitted health check signal for device ${ctx.deviceId}`);
+        Cadenza.log(`Emitted health check signal for device ${ctx.deviceId}`);
         return ctx;
       },
       'Emits a signal to trigger the Health Check flow'
@@ -82,85 +82,87 @@ Cadenza.createRoutine(
   'Triggers Alert Escalation via signal'
 ).doOn("health.alert_escalation");
 
+async function runMockScheduler (ctx: any, emit: any) {
+  const trafficMode = process.env.TRAFFIC_MODE || 'low';
+  const deviceCount = parseInt(process.env.DEVICE_COUNT || '50');
+  const now = new Date();
+
+  // Simulate random device selection
+  const deviceId = `device-${Math.floor(Math.random() * deviceCount) + 1}`;
+
+  // Generate base random readings (with slight bias in high traffic for anomalies)
+  const baseTemp = 20 + Math.random() * 60;
+  const baseHumidity = 30 + Math.random() * 40;
+  const battery = 50 + Math.random() * 50;
+
+  // Apply anomaly simulation based on thresholds (more frequent in high traffic)
+  const anomalyBias = trafficMode === 'high' ? 0.2 : 0.05; // Probability to exceed threshold
+  let temperature = baseTemp;
+  let humidity = baseHumidity;
+  let anomalyFlag = false;
+  let anomalyReason = '';
+
+  // Temperature anomaly: >80°C (overheat) or <10°C (freeze)
+  if (Math.random() < anomalyBias) {
+    temperature = Math.random() < 0.5 ? baseTemp + 25 : baseTemp - 15; // Spike or drop
+    anomalyFlag = temperature > 80 || temperature < 10;
+    if (anomalyFlag) anomalyReason = `Temperature out of range: ${temperature}°C`;
+  }
+
+  // Humidity anomaly: >90% (condensation) or <20% (dry)
+  if (!anomalyFlag && Math.random() < anomalyBias) {
+    humidity = Math.random() < 0.5 ? baseHumidity + 65 : baseHumidity - 15; // Spike or drop
+    anomalyFlag = humidity > 90 || humidity < 20;
+    if (anomalyFlag) anomalyReason = `Humidity out of range: ${humidity}%`;
+  }
+
+  // Combined anomaly if both exceed (rare, for escalation testing)
+  if (Math.random() < 0.02) { // 2% chance for dual anomaly
+    temperature = Math.random() < 0.5 ? 85 : 5;
+    humidity = Math.random() < 0.5 ? 95 : 15;
+    anomalyFlag = true;
+    anomalyReason = `Dual anomaly: Temp ${temperature}°C, Humidity ${humidity}%`;
+  }
+
+  const readings = { temperature, humidity, battery };
+
+  const mockCtx = {
+    deviceId,
+    readings,
+    timestamp: now,
+    anomalyFlag,
+    anomalyReason: anomalyReason || null
+  };
+
+  // Trigger Mock Telemetry Ingestion routine (delegates persistence to IotDbService)
+  emit("runner.new_telemetry", mockCtx);
+
+  // Randomly trigger flows based on mode and anomaly
+  if (Math.random() < (trafficMode === 'high' ? 0.7 : 0.3)) {
+    emit("health.check", { deviceId });
+  }
+
+  if (anomalyFlag && Math.random() < 0.5) {
+    emit("predictor.maintenance_needed", { deviceId });
+  }
+
+  // Simulate reactive escalation (e.g., 10% chance on high anomaly)
+  if (anomalyFlag && trafficMode === 'high' && Math.random() < 0.1) {
+    emit("health.alert_escalation", {
+      deviceId,
+      severity: 'high',
+      reason: anomalyReason || 'Anomaly spike detected',
+    });
+  }
+
+  Cadenza.log(`Scheduler tick: Mocked event for ${deviceId} (anomaly: ${anomalyFlag ? 'yes (' + anomalyReason + ')' : 'no'})`);
+  return { success: true, eventsGenerated: 1 };
+}
+
 // Scheduler Task: Runs periodically to mock events and trigger flows
 Cadenza.createTask(
   'RunMockScheduler',
-  async (ctx: any, emit: any) => {
-    const trafficMode = process.env.TRAFFIC_MODE || 'low';
-    const deviceCount = parseInt(process.env.DEVICE_COUNT || '50');
-    const now = new Date();
-
-    // Simulate random device selection
-    const deviceId = `device-${Math.floor(Math.random() * deviceCount) + 1}`;
-
-    // Generate base random readings (with slight bias in high traffic for anomalies)
-    const baseTemp = 20 + Math.random() * 60;
-    const baseHumidity = 30 + Math.random() * 40;
-    const battery = 50 + Math.random() * 50;
-
-    // Apply anomaly simulation based on thresholds (more frequent in high traffic)
-    const anomalyBias = trafficMode === 'high' ? 0.2 : 0.05; // Probability to exceed threshold
-    let temperature = baseTemp;
-    let humidity = baseHumidity;
-    let anomalyFlag = false;
-    let anomalyReason = '';
-
-    // Temperature anomaly: >80°C (overheat) or <10°C (freeze)
-    if (Math.random() < anomalyBias) {
-      temperature = Math.random() < 0.5 ? baseTemp + 25 : baseTemp - 15; // Spike or drop
-      anomalyFlag = temperature > 80 || temperature < 10;
-      if (anomalyFlag) anomalyReason = `Temperature out of range: ${temperature}°C`;
-    }
-
-    // Humidity anomaly: >90% (condensation) or <20% (dry)
-    if (!anomalyFlag && Math.random() < anomalyBias) {
-      humidity = Math.random() < 0.5 ? baseHumidity + 65 : baseHumidity - 15; // Spike or drop
-      anomalyFlag = humidity > 90 || humidity < 20;
-      if (anomalyFlag) anomalyReason = `Humidity out of range: ${humidity}%`;
-    }
-
-    // Combined anomaly if both exceed (rare, for escalation testing)
-    if (Math.random() < 0.02) { // 2% chance for dual anomaly
-      temperature = Math.random() < 0.5 ? 85 : 5;
-      humidity = Math.random() < 0.5 ? 95 : 15;
-      anomalyFlag = true;
-      anomalyReason = `Dual anomaly: Temp ${temperature}°C, Humidity ${humidity}%`;
-    }
-
-    const readings = { temperature, humidity, battery };
-
-    const mockCtx = {
-      deviceId,
-      readings,
-      timestamp: now,
-      anomalyFlag,
-      anomalyReason: anomalyReason || null
-    };
-
-    // Trigger Mock Telemetry Ingestion routine (delegates persistence to IotDbService)
-    emit("runner.new_telemetry", mockCtx);
-
-    // Randomly trigger flows based on mode and anomaly
-    if (Math.random() < (trafficMode === 'high' ? 0.7 : 0.3)) {
-      emit("health.check", { deviceId });
-    }
-
-    if (anomalyFlag && Math.random() < 0.5) {
-      emit("predictor.maintenance_needed", { deviceId });
-    }
-
-    // Simulate reactive escalation (e.g., 10% chance on high anomaly)
-    if (anomalyFlag && trafficMode === 'high' && Math.random() < 0.1) {
-      emit("health.alert_escalation", {
-        deviceId,
-        severity: 'high',
-        reason: anomalyReason || 'Anomaly spike detected',
-      });
-    }
-
-    console.log(`Scheduler tick: Mocked event for ${deviceId} (anomaly: ${anomalyFlag ? 'yes (' + anomalyReason + ')' : 'no'})`);
-    return { success: true, eventsGenerated: 1 };
-  },
+  runMockScheduler,
   'Runs the mock scheduler to generate events and trigger flows'
 ).doOn("tick.started");
 
@@ -181,18 +183,18 @@ setTimeout(() => {
 
 // Start the cron scheduler after Cadenza initializes
 process.on('cadenza-ready', () => {
-  console.log('Cadenza ready—starting dynamic traffic simulator');
+  Cadenza.log('Cadenza ready—starting dynamic traffic simulator');
 
   const simulateTick = async () => {
     // Emit signal to trigger the mock scheduler task
-    Cadenza.broker.emit("tick.started", {});
+    Cadenza.emit("tick.started", {});
 
     const minDelay = 1000;
     const maxDelay = 200000;
 
     const nextDelay = minDelay + Math.random() * (maxDelay - minDelay);
 
-    console.log(`Dynamic tick complete. Next tick in ${(nextDelay / 1000).toFixed(0)} seconds.`);
+    Cadenza.log(`Dynamic tick complete. Next tick in ${(nextDelay / 1000).toFixed(0)} seconds.`);
 
     // Schedule next tick
     setTimeout(simulateTick, nextDelay);

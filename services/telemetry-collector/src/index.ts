@@ -9,7 +9,7 @@ const validateTask = Cadenza.createTask(
       }
       // Emit local signal for validation status
       emit('tememetry.data_validated', { valid: true, deviceId: ctx.deviceId });
-      console.log(`Validated telemetry for device ${ctx.deviceId}`);
+      Cadenza.log(`Validated telemetry for device ${ctx.deviceId}`);
       return ctx;
     },
     'Validates incoming telemetry data and emits local validation signal'
@@ -23,7 +23,7 @@ const validateTask = Cadenza.createTask(
         if (tempZScore > 3) {
           ctx.filtered = false;
           emit('telemetry.outlier_detected', { deviceId: ctx.deviceId, metric: 'temperature' });
-          console.log(`Filtered outlier for device ${ctx.deviceId}: temp=${telemetry.readings.temperature}`);
+          Cadenza.log(`Filtered outlier for device ${ctx.deviceId}: temp=${telemetry.readings.temperature}`);
           return { ...ctx, filtered: false };
         }
         ctx.filtered = true;
