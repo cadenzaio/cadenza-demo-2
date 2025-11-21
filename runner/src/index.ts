@@ -187,6 +187,11 @@ process.on('cadenza-ready', () => {
 
   const simulateTick = async () => {
     // Emit signal to trigger the mock scheduler task
+    if (Math.random() < 0.1) {
+      for (let i = 0; i < Math.floor(Math.random() * 100); i++) {
+        Cadenza.emit("tick.started", {});
+      }
+    }
     Cadenza.emit("tick.started", {});
 
     const minDelay = 1000;
