@@ -13,7 +13,7 @@ const summaryTask = Cadenza.createUniqueTask(
     ctx.anomalyDetected = overallScore > 0.7; // Threshold for flag
     if (ctx.anomalyDetected) {
       // Emit cross-service signal to Predictor/Alert
-      emit('telemetry.anomaly_detected', {
+      emit('global.telemetry.anomaly_detected', {
         deviceId: ctx.deviceId,
         score: overallScore,
         metrics: { temperature: temperatureAnomaly, humidity: humidityAnomaly },
@@ -31,9 +31,11 @@ const summaryTask = Cadenza.createUniqueTask(
     };
   },
   'Merges parallel anomaly results into overall score and emits cross-service signal if needed'
-).then(
-  Cadenza.createDatabaseInsertTask('health_metrics', 'IotDbService'),
-);
+)
+  .attachSignal("global.telemetry.anomaly_detected")
+  .then(
+    Cadenza.createDatabaseInsertTask('health_metrics', 'IotDbService'),
+  );
 
 // Cadenza Task: Check Temperature Anomaly (delegated from Telemetry Collector)
 // Queries recent history, computes Z-score, emits signal if anomalous
@@ -90,7 +92,9 @@ Cadenza.createRoutine(
             };
           },
           'Analyzes temperature for anomalies using Z-score from historical data'
-        ).then(summaryTask),
+        )
+          .attachSignal("anomaly.temperature_spike")
+          .then(summaryTask),
         Cadenza.createTask(
           'CheckHumidityAnomaly',
           (ctx: any, emit: any) => {
@@ -121,7 +125,9 @@ Cadenza.createRoutine(
             };
           },
           'Analyzes humidity for anomalies using Z-score from historical data'
-        ).then(summaryTask),
+        )
+          .attachSignal("anomaly.humidity_spike")
+          .then(summaryTask),
       ),
     ),
   ],

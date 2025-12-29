@@ -26,7 +26,7 @@ Cadenza.createRoutine(
       'EmitHealthCheckSignal',
       async (ctx: any, emit: any) => {
         // Emit cross-service signal to Telemetry Collector
-        emit('runner.health_check_triggered', {
+        emit('global.runner.health_check_triggered', {
           deviceId: ctx.deviceId,
           triggerType: 'scheduled',
         });
@@ -34,7 +34,7 @@ Cadenza.createRoutine(
         return ctx;
       },
       'Emits a signal to trigger the Health Check flow'
-    ),
+    ).attachSignal("global.runner.health_check_triggered"),
   ],
   'Triggers the Health Check routine via signal'
 ).doOn("health.check");
@@ -47,7 +47,7 @@ Cadenza.createRoutine(
     Cadenza.createTask(
       'EmitPredictiveSignal',
       async (ctx: any, emit: any) => {
-        emit('runner.predictive_maintenance_triggered', {
+        emit('global.runner.predictive_maintenance_triggered', {
           deviceId: ctx.deviceId,
           recentAnomaly: ctx.anomalyFlag || false,
         });
@@ -55,7 +55,7 @@ Cadenza.createRoutine(
         return ctx;
       },
       'Emits a signal to trigger Predictive Maintenance'
-    ),
+    ).attachSignal("global.runner.predictive_maintenance_triggered"),
   ],
   'Triggers Predictive Maintenance via signal'
 ).doOn("predictor.maintenance_needed");
@@ -68,7 +68,7 @@ Cadenza.createRoutine(
     Cadenza.createTask(
       'EmitEscalationSignal',
       async (ctx: any, emit: any) => {
-        emit('runner.alert_escalation_triggered', {
+        emit('global.runner.alert_escalation_triggered', {
           deviceId: ctx.deviceId,
           severity: ctx.severity,
           reason: ctx.reason,
@@ -77,7 +77,7 @@ Cadenza.createRoutine(
         return ctx;
       },
       'Emits a signal to trigger Alert Escalation'
-    ),
+    ).attachSignal("global.runner.alert_escalation_triggered"),
   ],
   'Triggers Alert Escalation via signal'
 ).doOn("health.alert_escalation");
@@ -164,7 +164,14 @@ Cadenza.createTask(
   'RunMockScheduler',
   runMockScheduler,
   'Runs the mock scheduler to generate events and trigger flows'
-).doOn("tick.started");
+)
+  .doOn("tick.started")
+  .attachSignal(
+    "runner.new_telemetry",
+    "health.check",
+    "predictor.maintenance_needed",
+    "health.alert_escalation",
+  );
 
 // Cadenza Service Setup
 Cadenza.createCadenzaService('ScheduledRunnerService', 'Mocks IoT device events and triggers monitoring flows', {
@@ -187,7 +194,7 @@ process.on('cadenza-ready', () => {
 
   const simulateTick = async () => {
     // Emit signal to trigger the mock scheduler task
-    if (Math.random() < 0.1) {
+    if (Math.random() < 0.3) {
       for (let i = 0; i < Math.floor(Math.random() * 100); i++) {
         Cadenza.emit("tick.started", {});
       }
@@ -195,7 +202,7 @@ process.on('cadenza-ready', () => {
     Cadenza.emit("tick.started", {});
 
     const minDelay = 1000;
-    const maxDelay = 200000;
+    const maxDelay = 100000;
 
     const nextDelay = minDelay + Math.random() * (maxDelay - minDelay);
 

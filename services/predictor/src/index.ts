@@ -108,9 +108,14 @@ const computePredictionTask = Cadenza.createUniqueTask(
     };
   },
   'Computes failure prediction from aggregated anomalies and weather data, emits signals, persists'
-).then(
-  Cadenza.createDatabaseInsertTask('health_metric', 'IotDbService'),
-);
+)
+  .attachSignal(
+    "predictor.maintenance_needed",
+    "predictor.prediction_ready"
+  )
+  .then(
+    Cadenza.createDatabaseInsertTask('health_metric', 'IotDbService'),
+  );
 
 // Cadenza Routine: Predictive Maintenance (triggered by 'predictive_maintenance_triggered' signal)
 // Fan-out yield: parallel history fetch and weather call, fan-in to compute prediction
@@ -130,25 +135,27 @@ const predictiveMaintenanceRoutine = Cadenza.createRoutine(
         };
       },
       'Initiates prediction and emits local start signal'
-    ).then(
-      Cadenza.createDatabaseQueryTask(
-        'health_metrics',
-        'IotDbService',
-        { limit: 10 },
-      ).then(
-        analyzeAnomalyHistoryTask.then(
+    )
+      .attachSignal("predictor.prediction_started")
+      .then(
+        Cadenza.createDatabaseQueryTask(
+          'health_metrics',
+          'IotDbService',
+          { limit: 10 },
+        ).then(
+          analyzeAnomalyHistoryTask.then(
+            computePredictionTask,
+          ),
+        ),
+        callWeatherApiTask.then(
           computePredictionTask,
         ),
       ),
-      callWeatherApiTask.then(
-        computePredictionTask,
-      ),
-    ),
   ],
   'Full predictive maintenance: fan-out history/weather, fan-in prediction, persist and signal'
 ).doOn(
-  "AnomalyDetectorService.telemetry.anomaly_detected",
-  "IotDbService.telemetry.inserted",
+  "global.telemetry.anomaly_detected",
+  "global.telemetry.inserted",
 );
 
 // Cadenza Service Setup
