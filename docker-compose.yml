@@ -1,5 +1,4 @@
 services:
-  # PostgreSQL App DB (persistent storage for telemetry, metrics, alerts)
   iot-db:
     image: postgres:16
     restart: always
@@ -8,7 +7,7 @@ services:
       POSTGRES_PASSWORD: iot_pass
       POSTGRES_DB: iot_health
     ports:
-      - "5433:5432"  # Expose on 5433 to avoid conflict with first demo
+      - "5433:5432"
     volumes:
       - iot_pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -19,17 +18,13 @@ services:
     networks:
       - iot-network
 
-  # CadenzaDB (meta orchestration)
   cadenza-db-service:
     container_name: cadenza-db-service
     build:
-      context: ./database  # Assume a shared database dir like first demo
+      context: ./database
       dockerfile: Dockerfile
     env_file:
       - ./database/.env
-    environment:
-      - DATABASE_ADDRESS=iot-db
-      - DATABASE_PORT=5432
     depends_on:
       iot-db:
         condition: service_healthy
@@ -40,7 +35,6 @@ services:
     networks:
       - iot-network
 
-  # Application Database Service (Cadenza service for app DB interactions via DatabaseTasks)
   iot-db-service:
     container_name: iot-db-service
     build:
@@ -49,11 +43,8 @@ services:
     env_file:
       - ./database/iot-db-service/.env
     environment:
-      - DATABASE_ADDRESS=iot-db
-      - DATABASE_PORT=5432
-      - DATABASE_USER=iot_user
-      - DATABASE_PASSWORD=iot_pass
-      - DATABASE_NAME=iot_health
+      - CADENZA_DB_ADDRESS=cadenza-db-service
+      - CADENZA_DB_PORT=8080
     depends_on:
       iot-db:
         condition: service_healthy
@@ -66,7 +57,6 @@ services:
     networks:
       - iot-network
 
-  # Telemetry Collector Service (3 instances: ingests raw data)
   telemetry-collector:
     build:
       context: ./services/telemetry-collector
@@ -79,7 +69,9 @@ services:
     depends_on:
       - cadenza-db-service
       - iot-db-service
-      - scheduled-runner
+      - anomaly-detector
+      - predictor
+      - alert-service
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
@@ -88,7 +80,6 @@ services:
     networks:
       - iot-network
 
-  # Anomaly Detector Service (4 instances: detects outliers)
   anomaly-detector:
     build:
       context: ./services/anomaly-detector
@@ -98,12 +89,9 @@ services:
     environment:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
-      - IOT_DB_SERVICE_ADDRESS=iot-db-service
-      - IOT_DB_SERVICE_PORT=3001
     depends_on:
       - cadenza-db-service
       - iot-db-service
-      - scheduled-runner
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
@@ -112,7 +100,6 @@ services:
     networks:
       - iot-network
 
-  # Predictor Service (2 instances: forecasts failures)
   predictor:
     build:
       context: ./services/predictor
@@ -122,10 +109,10 @@ services:
     environment:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
+      - WEATHER_API_KEY=${WEATHER_API_KEY:-}
     depends_on:
       - cadenza-db-service
       - iot-db-service
-      - scheduled-runner
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
@@ -134,32 +121,26 @@ services:
     networks:
       - iot-network
 
-  # Alert Service (3 instances: generates notifications)
-#  alert-service:
-#    build:
-#      context: ./services/alert-service
-#      dockerfile: Dockerfile
-#    env_file:
-#      - ./services/alert-service/.env
-#    environment:
-#      - CADENZA_DB_ADDRESS=cadenza-db-service
-#      - CADENZA_DB_PORT=8080
-#      - IOT_DB_SERVICE_ADDRESS=iot-db-service
-#      - IOT_DB_SERVICE_PORT=3001
-#    depends_on:
-#      - cadenza-db-service
-#      - iot-db-service
-#    volumes:
-#      - shared_telemetry:/shared
-#      - ./scripts:/scripts:ro
-#    working_dir: /app
-#    command: npm start
-#    deploy:
-#      replicas: 3
-#    networks:
-#      - iot-network
+  alert-service:
+    build:
+      context: ./services/alert-service
+      dockerfile: Dockerfile
+    env_file:
+      - ./services/alert-service/.env
+    environment:
+      - CADENZA_DB_ADDRESS=cadenza-db-service
+      - CADENZA_DB_PORT=8080
+    depends_on:
+      - cadenza-db-service
+      - iot-db-service
+    volumes:
+      - shared_telemetry:/shared
+      - ./scripts:/scripts:ro
+    working_dir: /app
+    command: npm start
+    networks:
+      - iot-network
 
-  # Scheduled Runner (1 instance: mocks device events)
   scheduled-runner:
     build:
       context: ./runner
@@ -169,11 +150,12 @@ services:
     environment:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
-      - TRAFFIC_MODE=low  # low|high
+      - TRAFFIC_MODE=low
       - DEVICE_COUNT=50
     depends_on:
       - cadenza-db-service
       - iot-db-service
+      - telemetry-collector
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro

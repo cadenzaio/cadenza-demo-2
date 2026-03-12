@@ -1,188 +1,220 @@
-import Cadenza from '@cadenza.io/service';
+import Cadenza from "@cadenza.io/service";
+import { IOT_INTENTS, type AnomalyResult, type DeviceReadings } from "./contracts.js";
 
-const summaryTask = Cadenza.createUniqueTask(
-  'MergeAnomalyResults',
-  (ctx: any, emit: any) => {
-    // Fan-in unique task: merge parallel results into overall score
-    const { temperatureAnomaly, humidityAnomaly } = ctx.joinedContexts.reduce((acc: any, c: any) => ({
-      temperatureAnomaly: acc.temperatureAnomaly || c.temperatureAnomaly,
-      humidityAnomaly: acc.humidityAnomaly || c.humidityAnomaly,
-    }), {});
-    const overallScore = ((temperatureAnomaly?.score || 0) + (humidityAnomaly?.score || 0)) / 2;
-    ctx.anomalyScore = overallScore;
-    ctx.anomalyDetected = overallScore > 0.7; // Threshold for flag
-    if (ctx.anomalyDetected) {
-      // Emit cross-service signal to Predictor/Alert
-      emit('global.telemetry.anomaly_detected', {
-        deviceId: ctx.deviceId,
-        score: overallScore,
-        metrics: { temperature: temperatureAnomaly, humidity: humidityAnomaly },
-      }, { targetServices: ['predictor', 'alert-service'] });
-      console.log(`Anomaly detected for ${ctx.deviceId}: score=${overallScore}`);
-    }
-    return {
-      ...ctx,
-      data: {
-        deviceId: ctx.deviceId,
-        timestamp: Date.now(),
-        anomalyScore: ctx.anomalyScore,
-        failureProbability: Math.random(),
-      },
-    };
+type AnomalyRuntimeState = {
+  recentTemperatures: number[];
+  recentHumidities: number[];
+  recentScores: number[];
+  lastAnomalyAt: string | null;
+};
+
+function mean(values: number[]): number {
+  if (values.length === 0) {
+    return 0;
+  }
+  return values.reduce((acc, value) => acc + value, 0) / values.length;
+}
+
+function stdDev(values: number[], center: number): number {
+  if (values.length < 2) {
+    return 0;
+  }
+
+  const variance =
+    values.reduce((acc, value) => acc + (value - center) ** 2, 0) / values.length;
+
+  return Math.sqrt(variance);
+}
+
+function safeZScore(value: number, values: number[]): number {
+  if (values.length < 2) {
+    return 0;
+  }
+
+  const center = mean(values);
+  const deviation = stdDev(values, center);
+
+  if (!Number.isFinite(deviation) || deviation === 0) {
+    return 0;
+  }
+
+  return Math.abs((value - center) / deviation);
+}
+
+const anomalyRuntimeActor = Cadenza.createActor<
+  { enabled: boolean },
+  AnomalyRuntimeState
+>({
+  name: "AnomalyRuntimeActor",
+  description:
+    "Runtime-only rolling telemetry statistics for anomaly detection history windows.",
+  defaultKey: "device:unknown",
+  keyResolver: (input: any) =>
+    typeof input?.deviceId === "string" ? input.deviceId : undefined,
+  initState: {
+    enabled: true,
   },
-  'Merges parallel anomaly results into overall score and emits cross-service signal if needed'
-)
-  .attachSignal("global.telemetry.anomaly_detected")
-  .then(
-    Cadenza.createDatabaseInsertTask('health_metrics', 'IotDbService'),
-  );
-
-// Cadenza Task: Check Temperature Anomaly (delegated from Telemetry Collector)
-// Queries recent history, computes Z-score, emits signal if anomalous
-Cadenza.createRoutine(
-  'CheckAnomaly',
-  [
-    Cadenza.createTask(
-      'Prepare query',
-      (ctx: any) => {
-        return {
-          ...ctx,
-          queryData: {
-            filter: { deviceId: ctx.deviceId },
-          },
-        }
-      },
-    ).then(
-      Cadenza.createDatabaseQueryTask(
-        'telemetry',
-        'IotDbService',
-        {
-          sort: {timestamp: 'desc'},
-          limit: 20,
-        }
-      ).then(
-        Cadenza.createTask(
-          'CheckTemperatureAnomaly',
-          (ctx: any, emit: any) => {
-            const temps = ctx.telemetrys?.map((h: any) => h.temperature);
-            if (temps.length < 2) {
-              return { score: 0, anomalous: false, reason: 'Insufficient data' };
-            }
-
-            // Simple Z-score calculation (mean + std dev)
-            const mean = temps.reduce((a: number, b: number) => a + b, 0) / temps.length;
-            const variance = temps.reduce((a: number, b: number) => a + Math.pow(b - mean, 2), 0) / temps.length;
-            const stdDev = Math.sqrt(variance);
-            const zScore = Math.abs((ctx.readings.temperature - mean) / stdDev);
-
-            const score = Math.min(zScore / 3, 1); // Normalize to 0-1 (threshold 3 std devs)
-            const anomalous = zScore > 2; // Mild anomaly threshold
-
-            if (anomalous) {
-              // Emit local signal for immediate handling
-              emit('anomaly.temperature_spike', { deviceId: ctx.deviceId, zScore, score });
-              console.log(`Temperature anomaly for ${ctx.deviceId}: Z-score=${zScore.toFixed(2)}, score=${score.toFixed(2)}`);
-            }
-
-            return {
-              score,
-              anomalous,
-              reason: anomalous ? `Z-score ${zScore.toFixed(2)} exceeds threshold` : 'Normal',
-              metric: 'temperature',
-            };
-          },
-          'Analyzes temperature for anomalies using Z-score from historical data'
-        )
-          .attachSignal("anomaly.temperature_spike")
-          .then(summaryTask),
-        Cadenza.createTask(
-          'CheckHumidityAnomaly',
-          (ctx: any, emit: any) => {
-
-            const hums = ctx.telemetrys.map((h: any) => h.humidity);
-            if (hums.length < 2) {
-              return { score: 0, anomalous: false, reason: 'Insufficient data' };
-            }
-
-            const mean = hums.reduce((a: number, b: number) => a + b, 0) / hums.length;
-            const variance = hums.reduce((a: number, b: number) => a + Math.pow(b - mean, 2), 0) / hums.length;
-            const stdDev = Math.sqrt(variance);
-            const zScore = Math.abs((ctx.readings.humidity - mean) / stdDev);
-
-            const score = Math.min(zScore / 3, 1);
-            const anomalous = zScore > 2;
-
-            if (anomalous) {
-              emit('anomaly.humidity_spike', { deviceId: ctx.deviceId, zScore, score });
-              console.log(`Humidity anomaly for ${ctx.deviceId}: Z-score=${zScore.toFixed(2)}, score=${score.toFixed(2)}`);
-            }
-
-            return {
-              score,
-              anomalous,
-              reason: anomalous ? `Z-score ${zScore.toFixed(2)} exceeds threshold` : 'Normal',
-              metric: 'humidity',
-            };
-          },
-          'Analyzes humidity for anomalies using Z-score from historical data'
-        )
-          .attachSignal("anomaly.humidity_spike")
-          .then(summaryTask),
-      ),
-    ),
-  ],
-);
-
-
-// Cadenza Routine: Anomaly Detection (exposed for delegation from Telemetry Collector)
-// Handles specific metric checks; can be extended for battery, etc.
-// const anomalyDetectionRoutine = Cadenza.createRoutine(
-//   'AnomalyDetection',
-//   [
-//     Cadenza.createTask(
-//       'DetectMetricAnomaly',
-//       async (ctx: any, emit: any) => {
-//         let result;
-//         switch (ctx.metric) {
-//           case 'temperature':
-//             result = await Cadenza.runTask('CheckTemperatureAnomaly', ctx);
-//             break;
-//           case 'humidity':
-//             result = await Cadenza.runTask('CheckHumidityAnomaly', ctx);
-//             break;
-//           default:
-//             throw new Error(`Unknown metric: ${ctx.metric}`);
-//         }
-//         if (result.anomalous) {
-//           // Emit cross-service signal to Predictor/Alert if score > 0.7
-//           if (result.score > 0.7) {
-//             emit('anomaly_detected', {
-//               deviceId: ctx.deviceId,
-//               score: result.score,
-//               metric: result.metric,
-//               reason: result.reason,
-//             }, { targetServices: ['predictor', 'alert-service'] });
-//           }
-//         }
-//         return result;
-//       },
-//       'Detects anomalies for a specific metric and emits signals if needed'
-//     ),
-//   ],
-//   'Delegated anomaly detection for a metric (temperature or humidity)'
-// );
-
-// Cadenza Service Setup
-Cadenza.createCadenzaService('AnomalyDetectorService', 'Detects outliers in IoT telemetry using statistical analysis', {
-  cadenzaDB: {
-    connect: true,
-    address: process.env.CADENZA_DB_ADDRESS || 'cadenza-db-service',
-    port: parseInt(process.env.CADENZA_DB_PORT || '8080'),
+  session: {
+    persistDurableState: false,
   },
 });
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('Anomaly Detector shutting down gracefully');
+const normalizeAnomalyInputTask = Cadenza.createTask(
+  "Normalize anomaly detect input",
+  (ctx: any) => {
+    const deviceId = typeof ctx.deviceId === "string" ? ctx.deviceId.trim() : "";
+    const timestamp =
+      typeof ctx.timestamp === "string" && ctx.timestamp.length > 0
+        ? ctx.timestamp
+        : new Date().toISOString();
+
+    const readings = ctx.readings ?? {};
+    const temperature = Number(readings.temperature);
+    const humidity = Number(readings.humidity);
+    const battery = Number(readings.battery ?? 100);
+
+    if (!deviceId) {
+      throw new Error("deviceId is required for iot-anomaly-detect");
+    }
+
+    if (!Number.isFinite(temperature) || !Number.isFinite(humidity)) {
+      throw new Error("readings.temperature and readings.humidity are required numbers");
+    }
+
+    const normalizedReadings: DeviceReadings = {
+      temperature,
+      humidity,
+      battery: Number.isFinite(battery) ? battery : 100,
+    };
+
+    return {
+      ...ctx,
+      deviceId,
+      timestamp,
+      readings: normalizedReadings,
+    };
+  },
+  "Normalizes anomaly-detect input and enforces canonical payload contract.",
+);
+
+const detectAnomalyTask = Cadenza.createTask(
+  "Detect anomaly from rolling runtime history",
+  anomalyRuntimeActor.task(
+    ({ input, runtimeState, setRuntimeState }) => {
+      const state: AnomalyRuntimeState = runtimeState ?? {
+        recentTemperatures: [],
+        recentHumidities: [],
+        recentScores: [],
+        lastAnomalyAt: null,
+      };
+
+      const tempHistory = state.recentTemperatures;
+      const humidityHistory = state.recentHumidities;
+
+      const tempZScore = safeZScore(input.readings.temperature, tempHistory);
+      const humidityZScore = safeZScore(input.readings.humidity, humidityHistory);
+
+      const tempScore = Math.min(tempZScore / 3, 1);
+      const humidityScore = Math.min(humidityZScore / 3, 1);
+      const anomalyScore = Number(((tempScore + humidityScore) / 2).toFixed(4));
+
+      const temperatureAnomalous = tempZScore > 2;
+      const humidityAnomalous = humidityZScore > 2;
+      const anomalyDetected =
+        anomalyScore >= 0.65 || temperatureAnomalous || humidityAnomalous;
+
+      const reason = anomalyDetected
+        ? `Anomaly score ${anomalyScore.toFixed(3)} (tempZ=${tempZScore.toFixed(2)}, humidityZ=${humidityZScore.toFixed(2)})`
+        : "No anomaly threshold crossed";
+
+      const nextRuntimeState: AnomalyRuntimeState = {
+        recentTemperatures: [...tempHistory, input.readings.temperature].slice(-50),
+        recentHumidities: [...humidityHistory, input.readings.humidity].slice(-50),
+        recentScores: [...state.recentScores, anomalyScore].slice(-50),
+        lastAnomalyAt: anomalyDetected ? input.timestamp : state.lastAnomalyAt,
+      };
+
+      setRuntimeState(nextRuntimeState);
+
+      const anomalyResult: AnomalyResult = {
+        deviceId: input.deviceId,
+        timestamp: input.timestamp,
+        anomalyDetected,
+        anomalyScore,
+        reason,
+        metrics: {
+          temperature: {
+            score: Number(tempScore.toFixed(4)),
+            zScore: Number(tempZScore.toFixed(4)),
+            anomalous: temperatureAnomalous,
+          },
+          humidity: {
+            score: Number(humidityScore.toFixed(4)),
+            zScore: Number(humidityZScore.toFixed(4)),
+            anomalous: humidityAnomalous,
+          },
+        },
+      };
+
+      return anomalyResult;
+    },
+    { mode: "write" },
+  ),
+  "Computes anomaly result using runtime-only rolling stats and handles empty-series/zero-variance safely.",
+);
+
+const finalizeAnomalyResponseTask = Cadenza.createTask(
+  "Finalize anomaly response",
+  (ctx: any) => {
+    return {
+      __success: true,
+      deviceId: ctx.deviceId,
+      timestamp: ctx.timestamp,
+      anomalyDetected: Boolean(ctx.anomalyDetected),
+      anomalyScore: Number(ctx.anomalyScore ?? 0),
+      reason: String(ctx.reason ?? "No anomaly"),
+      metrics: ctx.metrics,
+    };
+  },
+  "Builds canonical iot-anomaly-detect response payload.",
+);
+
+normalizeAnomalyInputTask
+  .then(detectAnomalyTask)
+  .then(finalizeAnomalyResponseTask)
+  .respondsTo(IOT_INTENTS.anomalyDetect);
+
+Cadenza.createTask(
+  "Read anomaly runtime session",
+  anomalyRuntimeActor.task(
+    ({ actor, runtimeState }) => ({
+      __success: true,
+      actorKey: actor.key,
+      runtimeSession: runtimeState ?? {
+        recentTemperatures: [],
+        recentHumidities: [],
+        recentScores: [],
+        lastAnomalyAt: null,
+      },
+    }),
+    { mode: "read" },
+  ),
+  "Exposes runtime anomaly cache state for debugging.",
+).respondsTo("iot-anomaly-runtime-get");
+
+Cadenza.createCadenzaService(
+  "AnomalyDetectorService",
+  "Computes canonical anomaly results using runtime rolling telemetry history.",
+  {
+    cadenzaDB: {
+      connect: true,
+      address: process.env.CADENZA_DB_ADDRESS ?? "cadenza-db-service",
+      port: parseInt(process.env.CADENZA_DB_PORT ?? "8080", 10),
+    },
+  },
+);
+
+process.on("SIGTERM", () => {
+  Cadenza.log("Anomaly Detector shutting down gracefully.");
   process.exit(0);
 });

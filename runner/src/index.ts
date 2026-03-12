@@ -1,219 +1,239 @@
-import Cadenza from '@cadenza.io/service';
-import { mockTelemetryEvent } from './scheduler.js';
+import Cadenza from "@cadenza.io/service";
+import { IOT_INTENTS, type TelemetryIngestPayload } from "./contracts.js";
 
-// Cadenza Routine: Mock Telemetry Ingestion
-// This routine is triggered by signals from the scheduler and mocks a device event
-Cadenza.createRoutine(
-  'MockTelemetryIngestion',
-  [
-    Cadenza.createTask(
-      'GenerateRandomTelemetry',
-      mockTelemetryEvent,
-      'Generates random sensor data for a device'
-    ).then(
-      Cadenza.createDatabaseInsertTask("telemetry", "IotDbService"),
-    ),
-  ],
-  'Mocks and delegates persistence of a telemetry event to kick off monitoring flows'
-).doOn("runner.new_telemetry");
+type TrafficRuntimeState = {
+  tickCount: number;
+  totalEventsEmitted: number;
+  lastDelayMs: number;
+  lastBurstCount: number;
+  trafficMode: "low" | "high";
+};
 
-// Cadenza Routine: Trigger Health Check Flow
-// Emits a signal to trigger the Health Check routine in Telemetry Collector
-Cadenza.createRoutine(
-  'TriggerHealthCheck',
-  [
-    Cadenza.createTask(
-      'EmitHealthCheckSignal',
-      async (ctx: any, emit: any) => {
-        // Emit cross-service signal to Telemetry Collector
-        emit('global.runner.health_check_triggered', {
-          deviceId: ctx.deviceId,
-          triggerType: 'scheduled',
-        });
-        Cadenza.log(`Emitted health check signal for device ${ctx.deviceId}`);
-        return ctx;
-      },
-      'Emits a signal to trigger the Health Check flow'
-    ).attachSignal("global.runner.health_check_triggered"),
-  ],
-  'Triggers the Health Check routine via signal'
-).doOn("health.check");
+const defaultRuntimeState: TrafficRuntimeState = {
+  tickCount: 0,
+  totalEventsEmitted: 0,
+  lastDelayMs: 1000,
+  lastBurstCount: 1,
+  trafficMode: "low",
+};
 
-// Cadenza Routine: Trigger Predictive Maintenance Flow
-// Emits a signal to trigger Predictive Maintenance in Predictor Service
-Cadenza.createRoutine(
-  'TriggerPredictiveMaintenance',
-  [
-    Cadenza.createTask(
-      'EmitPredictiveSignal',
-      async (ctx: any, emit: any) => {
-        emit('global.runner.predictive_maintenance_triggered', {
-          deviceId: ctx.deviceId,
-          recentAnomaly: ctx.anomalyFlag || false,
-        });
-        console.log(`Emitted predictive maintenance signal for device ${ctx.deviceId}`);
-        return ctx;
-      },
-      'Emits a signal to trigger Predictive Maintenance'
-    ).attachSignal("global.runner.predictive_maintenance_triggered"),
-  ],
-  'Triggers Predictive Maintenance via signal'
-).doOn("predictor.maintenance_needed");
 
-// Cadenza Routine: Trigger Alert Escalation Flow
-// Emitted reactively by signals from other services
-Cadenza.createRoutine(
-  'TriggerAlertEscalation',
-  [
-    Cadenza.createTask(
-      'EmitEscalationSignal',
-      async (ctx: any, emit: any) => {
-        emit('global.runner.alert_escalation_triggered', {
-          deviceId: ctx.deviceId,
-          severity: ctx.severity,
-          reason: ctx.reason,
-        });
-        console.log(`Emitted alert escalation signal for device ${ctx.deviceId}`);
-        return ctx;
-      },
-      'Emits a signal to trigger Alert Escalation'
-    ).attachSignal("global.runner.alert_escalation_triggered"),
-  ],
-  'Triggers Alert Escalation via signal'
-).doOn("health.alert_escalation");
-
-async function runMockScheduler (ctx: any, emit: any) {
-  const trafficMode = process.env.TRAFFIC_MODE || 'low';
-  const deviceCount = parseInt(process.env.DEVICE_COUNT || '50');
-  const now = new Date();
-
-  // Simulate random device selection
-  const deviceId = `device-${Math.floor(Math.random() * deviceCount) + 1}`;
-
-  // Generate base random readings (with slight bias in high traffic for anomalies)
-  const baseTemp = 20 + Math.random() * 60;
-  const baseHumidity = 30 + Math.random() * 40;
-  const battery = 50 + Math.random() * 50;
-
-  // Apply anomaly simulation based on thresholds (more frequent in high traffic)
-  const anomalyBias = trafficMode === 'high' ? 0.2 : 0.05; // Probability to exceed threshold
-  let temperature = baseTemp;
-  let humidity = baseHumidity;
-  let anomalyFlag = false;
-  let anomalyReason = '';
-
-  // Temperature anomaly: >80°C (overheat) or <10°C (freeze)
-  if (Math.random() < anomalyBias) {
-    temperature = Math.random() < 0.5 ? baseTemp + 25 : baseTemp - 15; // Spike or drop
-    anomalyFlag = temperature > 80 || temperature < 10;
-    if (anomalyFlag) anomalyReason = `Temperature out of range: ${temperature}°C`;
-  }
-
-  // Humidity anomaly: >90% (condensation) or <20% (dry)
-  if (!anomalyFlag && Math.random() < anomalyBias) {
-    humidity = Math.random() < 0.5 ? baseHumidity + 65 : baseHumidity - 15; // Spike or drop
-    anomalyFlag = humidity > 90 || humidity < 20;
-    if (anomalyFlag) anomalyReason = `Humidity out of range: ${humidity}%`;
-  }
-
-  // Combined anomaly if both exceed (rare, for escalation testing)
-  if (Math.random() < 0.02) { // 2% chance for dual anomaly
-    temperature = Math.random() < 0.5 ? 85 : 5;
-    humidity = Math.random() < 0.5 ? 95 : 15;
-    anomalyFlag = true;
-    anomalyReason = `Dual anomaly: Temp ${temperature}°C, Humidity ${humidity}%`;
-  }
-
-  const readings = { temperature, humidity, battery };
-
-  const mockCtx = {
-    deviceId,
-    readings,
-    timestamp: now,
-    anomalyFlag,
-    anomalyReason: anomalyReason || null
-  };
-
-  // Trigger Mock Telemetry Ingestion routine (delegates persistence to IotDbService)
-  emit("runner.new_telemetry", mockCtx);
-
-  // Randomly trigger flows based on mode and anomaly
-  if (Math.random() < (trafficMode === 'high' ? 0.7 : 0.3)) {
-    emit("health.check", { deviceId });
-  }
-
-  if (anomalyFlag && Math.random() < 0.5) {
-    emit("predictor.maintenance_needed", { deviceId });
-  }
-
-  // Simulate reactive escalation (e.g., 10% chance on high anomaly)
-  if (anomalyFlag && trafficMode === 'high' && Math.random() < 0.1) {
-    emit("health.alert_escalation", {
-      deviceId,
-      severity: 'high',
-      reason: anomalyReason || 'Anomaly spike detected',
-    });
-  }
-
-  Cadenza.log(`Scheduler tick: Mocked event for ${deviceId} (anomaly: ${anomalyFlag ? 'yes (' + anomalyReason + ')' : 'no'})`);
-  return { success: true, eventsGenerated: 1 };
-}
-
-// Scheduler Task: Runs periodically to mock events and trigger flows
-Cadenza.createTask(
-  'RunMockScheduler',
-  runMockScheduler,
-  'Runs the mock scheduler to generate events and trigger flows'
-)
-  .doOn("tick.started")
-  .attachSignal(
-    "runner.new_telemetry",
-    "health.check",
-    "predictor.maintenance_needed",
-    "health.alert_escalation",
-  );
-
-// Cadenza Service Setup
-Cadenza.createCadenzaService('ScheduledRunnerService', 'Mocks IoT device events and triggers monitoring flows', {
-  cadenzaDB: {
-    connect: true,
-    address: process.env.CADENZA_DB_ADDRESS || 'cadenza-db-service',
-    port: parseInt(process.env.CADENZA_DB_PORT || '8080'),
+const trafficRuntimeActor = Cadenza.createActor<
+  { mode: "low" | "high" },
+  TrafficRuntimeState
+>({
+  name: "TrafficRuntimeActor",
+  description:
+    "Runtime-only scheduler pacing actor for dummy telemetry traffic generation.",
+  defaultKey: "runner",
+  initState: {
+    mode: "low",
+  },
+  session: {
+    persistDurableState: false,
   },
 });
 
-// Manual emit after a delay (or hook into connect promise if exposed)
-setTimeout(() => {
-  // @ts-ignore
-  process.emit('cadenza-ready');
-}, 60000);  // Adjust delay based on init time
+const computeTickPlanTask = Cadenza.createTask(
+  "Compute traffic tick plan",
+  trafficRuntimeActor.task(
+    ({ input, runtimeState, setRuntimeState }) => {
+      const configuredMode =
+        input?.trafficMode === "high" || process.env.TRAFFIC_MODE === "high"
+          ? "high"
+          : "low";
+      const deviceCount = Math.max(parseInt(process.env.DEVICE_COUNT ?? "50", 10), 1);
 
-// Start the cron scheduler after Cadenza initializes
-process.on('cadenza-ready', () => {
-  Cadenza.log('Cadenza ready—starting dynamic traffic simulator');
+      const currentRuntime: TrafficRuntimeState = runtimeState ?? {
+        ...defaultRuntimeState,
+        trafficMode: configuredMode,
+      };
 
-  const simulateTick = async () => {
-    // Emit signal to trigger the mock scheduler task
-    if (Math.random() < 0.3) {
-      for (let i = 0; i < Math.floor(Math.random() * 100); i++) {
-        Cadenza.emit("tick.started", {});
+      const burstChance = configuredMode === "high" ? 0.45 : 0.2;
+      const burstMax = configuredMode === "high" ? 8 : 3;
+      const burstCount =
+        Math.random() < burstChance ? 1 + Math.floor(Math.random() * burstMax) : 1;
+
+      const minDelay = configuredMode === "high" ? 800 : 3500;
+      const maxDelay = configuredMode === "high" ? 8000 : 25000;
+      const nextDelayMs = Math.floor(minDelay + Math.random() * (maxDelay - minDelay));
+
+      const payloads: TelemetryIngestPayload[] = [];
+
+      for (let i = 0; i < burstCount; i += 1) {
+        const deviceId = `device-${Math.floor(Math.random() * deviceCount) + 1}`;
+        const baseTemp = 20 + Math.random() * 55;
+        const baseHumidity = 25 + Math.random() * 60;
+        const anomalyBias = configuredMode === "high" ? 0.25 : 0.08;
+
+        let temperature = baseTemp;
+        let humidity = baseHumidity;
+
+        if (Math.random() < anomalyBias) {
+          temperature += Math.random() < 0.5 ? 20 : -12;
+        }
+
+        if (Math.random() < anomalyBias) {
+          humidity += Math.random() < 0.5 ? 25 : -18;
+        }
+
+        payloads.push({
+          deviceId,
+          timestamp: new Date().toISOString(),
+          readings: {
+            temperature: Number(temperature.toFixed(2)),
+            humidity: Number(humidity.toFixed(2)),
+            battery: Number((45 + Math.random() * 55).toFixed(2)),
+          },
+          source: "scheduler",
+          trafficMode: configuredMode,
+        });
+      }
+
+      setRuntimeState({
+        tickCount: currentRuntime.tickCount + 1,
+        totalEventsEmitted: currentRuntime.totalEventsEmitted + burstCount,
+        lastDelayMs: nextDelayMs,
+        lastBurstCount: burstCount,
+        trafficMode: configuredMode,
+      });
+
+      return {
+        payloads,
+        nextDelayMs,
+        burstCount,
+        tickCount: currentRuntime.tickCount + 1,
+      };
+    },
+    { mode: "write" },
+  ),
+  "Builds the next tick ingestion plan from runtime-only scheduler actor state.",
+);
+
+const ingestTelemetryBatchTask = Cadenza.createTask(
+  "Ingest telemetry batch",
+  async (ctx: any, _emit: any, inquire: any) => {
+    const payloads: TelemetryIngestPayload[] = Array.isArray(ctx.payloads)
+      ? ctx.payloads
+      : [];
+
+    if (payloads.length === 0) {
+      return {
+        ...ctx,
+        ingestFailures: 0,
+      };
+    }
+
+    let ingestFailures = 0;
+
+    for (const payload of payloads) {
+      try {
+        await inquire(IOT_INTENTS.telemetryIngest, payload, {
+          timeout: 12000,
+          rejectOnTimeout: true,
+          requireComplete: true,
+        });
+      } catch (error) {
+        ingestFailures += 1;
+        Cadenza.log(
+          "Telemetry ingest inquiry failed.",
+          {
+            deviceId: payload.deviceId,
+            error: String((error as Error)?.message ?? error),
+          },
+          "error",
+        );
       }
     }
-    Cadenza.emit("tick.started", {});
 
-    const minDelay = 1000;
-    const maxDelay = 100000;
+    return {
+      ...ctx,
+      ingestFailures,
+    };
+  },
+  "Invokes canonical telemetry ingest intent for each payload in the current tick.",
+);
 
-    const nextDelay = minDelay + Math.random() * (maxDelay - minDelay);
+const scheduleNextTickTask = Cadenza.createTask(
+  "Schedule next traffic tick",
+  (ctx: any, emit: any) => {
+    const nextDelayMs =
+      typeof ctx.nextDelayMs === "number" && ctx.nextDelayMs > 0
+        ? ctx.nextDelayMs
+        : 5000;
 
-    Cadenza.log(`Dynamic tick complete. Next tick in ${(nextDelay / 1000).toFixed(0)} seconds.`);
+    setTimeout(() => {
+      Cadenza.emit("runner.tick", {
+        trafficMode: process.env.TRAFFIC_MODE === "high" ? "high" : "low",
+      });
+    }, nextDelayMs);
 
-    // Schedule next tick
-    setTimeout(simulateTick, nextDelay);
-  };
+    emit("runner.tick_scheduled", {
+      nextDelayMs,
+      tickCount: ctx.tickCount,
+      burstCount: ctx.burstCount,
+      ingestFailures: ctx.ingestFailures ?? 0,
+    });
 
-  // Start the first tick immediately
-  simulateTick();
+    Cadenza.log(
+      `Runner tick ${ctx.tickCount} completed: burst=${ctx.burstCount}, failures=${ctx.ingestFailures ?? 0}, next=${Math.round(nextDelayMs / 1000)}s`,
+    );
+
+    return {
+      __success: true,
+      tickCount: ctx.tickCount,
+      burstCount: ctx.burstCount,
+      ingestFailures: ctx.ingestFailures ?? 0,
+      nextDelayMs,
+    };
+  },
+  "Schedules the next runner tick and emits local scheduler telemetry.",
+).attachSignal("runner.tick_scheduled");
+
+computeTickPlanTask.doOn("runner.tick").then(ingestTelemetryBatchTask).then(
+  scheduleNextTickTask,
+);
+
+const readTrafficRuntimeTask = Cadenza.createTask(
+  "Read traffic runtime state",
+  trafficRuntimeActor.task(({ runtimeState }) => runtimeState ?? defaultRuntimeState, {
+    mode: "read",
+  }),
+  "Returns the current runtime-only scheduler pacing state.",
+);
+
+readTrafficRuntimeTask.respondsTo("runner-traffic-runtime-get");
+
+Cadenza.createTask(
+  "Prime runner loop",
+  (_ctx: any, emit: any) => {
+    emit("runner.tick", {
+      trafficMode: process.env.TRAFFIC_MODE === "high" ? "high" : "low",
+    });
+    return true;
+  },
+  "Starts the runner tick loop after service bootstrap.",
+)
+  .doOn("runner.bootstrap")
+  .attachSignal("runner.tick");
+
+Cadenza.createCadenzaService(
+  "ScheduledRunnerService",
+  "Generates dummy IoT telemetry and drives canonical ingest intent flow.",
+  {
+    cadenzaDB: {
+      connect: true,
+      address: process.env.CADENZA_DB_ADDRESS ?? "cadenza-db-service",
+      port: parseInt(process.env.CADENZA_DB_PORT ?? "8080", 10),
+    },
+  },
+);
+
+Cadenza.emit("runner.bootstrap", {
+  startedAt: new Date().toISOString(),
 });
 
-console.log('Listening for cadenza-ready event');
+process.on("SIGTERM", () => {
+  Cadenza.log("Scheduled Runner shutting down gracefully.");
+  process.exit(0);
+});

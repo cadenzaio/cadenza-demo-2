@@ -8,11 +8,10 @@
     "build": "tsc"
   },
   "dependencies": {
-    "@cadenza.io/cadenza-db": "^2.5.10",
+    "@cadenza.io/cadenza-db": "^2.9.0",
     "typescript": "^5.3.3"
   },
   "devDependencies": {
     "@types/node": "^20.8.5"
   }
 }
-

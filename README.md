@@ -1,75 +1,115 @@
-# IoT Device Health Monitor Demo with Cadenza
+# cadenza-demo-2
 
-## Overview
+IoT demo stack for generating realistic distributed runtime metadata and data flows in Cadenza.
 
-This demo showcases an IoT device health monitoring system built with Cadenza, simulating a fleet of 50 virtual sensors (e.g., temperature/humidity devices). The system ingests mock telemetry data, detects anomalies, predicts failures using environmental context (via OpenWeatherMap API), and escalates alerts. It's designed to generate continuous, realistic data streams for the Cadenza UI, demonstrating features like fan-out/yield for parallel processing, fan-in unique tasks for aggregation, DeputyTasks for delegation, and local/cross-service signals for coordination.
+## What this demo now validates
 
-Key flows:
-- **Health Check**: Validates and filters data, fan-out to anomaly detectors, fan-in to score.
-- **Predictive Maintenance**: Aggregates anomalies with weather data, computes failure probability/ETA.
-- **Alert Escalation**: Fan-in notifications, triggers on high-risk signals.
+- canonical intent-driven orchestration (`iot-*` intents; current core disallows dots in inquiry names)
+- canonical global event contracts (`global.iot.*` signals)
+- actor-centric state handling
+  - persisted session actors for domain state
+  - runtime-only actors for infrastructure/cache state
+- strict durable actor persistence through `actor_session_state`
+- dual-database setup
+  - `cadenza-db-service` for Cadenza metadata
+  - `iot-db-service` for app telemetry/metrics/alerts
 
-The Scheduled Runner mocks events at random intervals (low: every 5 min; high: every 1 min) to simulate traffic, producing ~400-3K events/hour. Data persists in PostgreSQL for UI querying.
+## Services
 
-## Architecture and Services
+- `scheduled-runner` (`ScheduledRunnerService`)
+  - generates dummy telemetry traffic
+  - calls `iot-telemetry-ingest`
+  - owns runtime-only `TrafficRuntimeActor`
+- `telemetry-collector` (`TelemetryCollectorService`)
+  - responds to `iot-telemetry-ingest`
+  - persists telemetry rows
+  - calls anomaly + prediction intents
+  - emits `global.iot.telemetry.ingested` and `global.iot.anomaly.detected` when needed
+  - owns persisted `TelemetrySessionActor`
+- `anomaly-detector` (`AnomalyDetectorService`)
+  - responds to `iot-anomaly-detect`
+  - computes anomaly from rolling runtime history
+  - owns runtime-only `AnomalyRuntimeActor`
+- `predictor` (`PredictorService`)
+  - responds to `iot-prediction-compute`
+  - persists `health_metric`
+  - emits `global.iot.prediction.ready` or `global.iot.prediction.maintenance_needed`
+  - owns persisted `PredictionSessionActor` + runtime-only `WeatherRuntimeActor`
+- `alert-service` (`AlertService`)
+  - responds to `iot-alert-evaluate`
+  - subscribes to anomaly + maintenance signals
+  - dedupes/escalates and persists `alert`
+  - emits `global.iot.alert.raised`
+  - owns persisted `AlertSessionActor`
+- `iot-db-service` (`IotDbService`)
+  - application DB service + internal DB intents:
+    - `iot-db-telemetry-insert`
+    - `iot-db-health-metric-insert`
+    - `iot-db-alert-insert`
+- `cadenza-db-service`
+  - metadata DB service for graph + actor metadata/session state
 
-- **CadenzaDB**: Meta-orchestration for graphs, tasks, and signals.
-- **IoT DB Service**: Cadenza-wrapped PostgreSQL interactions (DatabaseTasks for inserts/queries on telemetry, metrics, alerts).
-- **Telemetry Collector** (3 replicas): Ingests/validates data, fan-out to detectors, reacts to `telementry.inserted` signals.
-- **Anomaly Detector** (4 replicas): Statistical analysis (Z-score) on metrics, emits `anomaly_detected` signals.
-- **Predictor** (2 replicas): Fan-out history/weather fetch, fan-in to predict failures, emits `maintenance_needed`.
-- **Alert Service** (3 replicas): Notification queuing, fan-in prioritization, emits escalation signals.
-- **Scheduled Runner** (1 instance): Mocks events via cron, emits signals to trigger flows (e.g., `runner.new_telemetry`).
+## Canonical Contracts
 
-Volumes: `iot_pgdata` (DB persistence), `shared_telemetry` (in-memory logs/signals). Network: `iot-network` for internal comms.
+### Global signals
 
-## Requirements
+- `global.iot.telemetry.ingested`
+- `global.iot.anomaly.detected`
+- `global.iot.prediction.ready`
+- `global.iot.prediction.maintenance_needed`
+- `global.iot.alert.raised`
 
-- Docker & Docker Compose (v2+)
-- Node.js 22 (for local dev/testing)
-- Free OpenWeatherMap API key (optional; set `WEATHER_API_KEY` in predictor `.env` for external calls)
-- ~2GB RAM/4 cores for full replicas (scales down for testing)
+### Public intents
 
-Clone the repo and ensure directories match (`core-demo/database`, `core-demo/services/*`, `core-demo/runner`).
+- `iot-telemetry-ingest`
+- `iot-anomaly-detect`
+- `iot-prediction-compute`
+- `iot-alert-evaluate`
+- `iot-telemetry-session-get`
+- `iot-prediction-session-get`
+- `iot-alert-session-get`
 
-## Setup and Run Commands
+### Payload convention
 
-1. **Full Startup** (builds/restarts everything, including DB init):
-   ```
-   docker-compose down -v  # Clean volumes if needed (WARNING: deletes DB data)
-   docker-compose up --build
-   ```
+- cross-service signal/intent payloads: camelCase (`deviceId`, `timestamp`, etc.)
+- DB payload data/filter: table-aligned keys (`device_id`, `anomaly_score`, etc.)
+- authoritative metrics table name: `health_metric` (singular)
 
-2. **View Logs** (all services):
-   ```
-   docker-compose logs -f
-   ```
+## Run
 
-3. **Restart Specific Service** (e.g., telemetry-collector; rebuilds if code changed):
-   ```
-   docker-compose up --build telemetry-collector
-   ```
+```bash
+docker-compose up --build
+```
 
-4. **Restart All Services Except DB** (preserves data; rebuilds if needed):
-   ```
-   docker-compose up --build cadenza-db-service iot-db-service telemetry-collector anomaly-detector predictor alert-service scheduled-runner
-   ```
+Stop:
 
-5. **Scale Traffic** (high for bursts; restart runner):
-   ```
-   docker-compose restart scheduled-runner  # Or set TRAFFIC_MODE=high in runner/.env and up --build
-   ```
+```bash
+docker-compose down
+```
 
-6. **Stop/Teardown** (keeps DB data):
-   ```
-   docker-compose down  # No -v to preserve pgdata
-   ```
+Reset all data:
 
-## Monitoring and Testing
+```bash
+docker-compose down -v
+```
 
-- **Check Replicas**: `docker-compose ps` (e.g., 3 telemetry-collector_* instances).
-- **Test Signal Flow**: Logs show emissions (e.g., "Emitted health check signal") and triggers.
-- **Query DB**: Connect to `localhost:5433` (user: iot_user, pass: iot_pass) to verify telemetry inserts.
-- **UI Data**: Query CadenzaDB for signals/events; ~400 events/hour in low mode.
+## Useful checks
 
-For dev: Edit code, rebuild specific service. Extend with more devices or APIs as needed. Issues? Check logs or CadenzaDB connections.
+- list containers:
+
+```bash
+docker-compose ps
+```
+
+- follow logs:
+
+```bash
+docker-compose logs -f
+```
+
+- Postgres is reachable on `localhost:5433` (`iot_user` / `iot_pass`); the demo services create and use `cadenza_db` and `iot_db_service`
+
+## Notes
+
+- `WEATHER_API_KEY` is optional; predictor falls back to neutral weather context when absent.
+- the runner defaults to `TRAFFIC_MODE=low` and `DEVICE_COUNT=50`.
