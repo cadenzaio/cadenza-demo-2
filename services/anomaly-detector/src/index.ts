@@ -1,6 +1,12 @@
 import Cadenza from "@cadenza.io/service";
 import { IOT_INTENTS, type AnomalyResult, type DeviceReadings } from "./contracts.js";
 
+const publicOrigin =
+  process.env.PUBLIC_ORIGIN ?? "http://anomaly-detector.localhost";
+const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "anomaly-detector"}:${
+  process.env.HTTP_PORT ?? "3004"
+}`;
+
 type AnomalyRuntimeState = {
   recentTemperatures: number[];
   recentHumidities: number[];
@@ -179,10 +185,9 @@ const finalizeAnomalyResponseTask = Cadenza.createTask(
   "Builds canonical iot-anomaly-detect response payload.",
 );
 
-normalizeAnomalyInputTask
-  .then(detectAnomalyTask)
-  .then(finalizeAnomalyResponseTask)
-  .respondsTo(IOT_INTENTS.anomalyDetect);
+normalizeAnomalyInputTask.then(detectAnomalyTask);
+detectAnomalyTask.then(finalizeAnomalyResponseTask);
+normalizeAnomalyInputTask.respondsTo(IOT_INTENTS.anomalyDetect);
 
 Cadenza.createTask(
   "Read anomaly runtime session",
@@ -206,15 +211,23 @@ Cadenza.createCadenzaService(
   "AnomalyDetectorService",
   "Computes canonical anomaly results using runtime rolling telemetry history.",
   {
+    useSocket: false,
     cadenzaDB: {
       connect: true,
       address: process.env.CADENZA_DB_ADDRESS ?? "cadenza-db-service",
       port: parseInt(process.env.CADENZA_DB_PORT ?? "8080", 10),
     },
+    transports: [
+      {
+        role: "internal",
+        origin: internalOrigin,
+        protocols: ["rest"],
+      },
+      {
+        role: "public",
+        origin: publicOrigin,
+        protocols: ["rest"],
+      },
+    ],
   },
 );
-
-process.on("SIGTERM", () => {
-  Cadenza.log("Anomaly Detector shutting down gracefully.");
-  process.exit(0);
-});

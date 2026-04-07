@@ -28,10 +28,23 @@ services:
     depends_on:
       iot-db:
         condition: service_healthy
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          node -e 'const fs=require("fs");
+          const stat=fs.statSync("/proc/1");
+          const ageMs=Date.now()-Math.max(stat.ctimeMs, stat.mtimeMs);
+          if (ageMs < 3000) process.exit(1);
+          fetch("http://127.0.0.1:8080/handshake",{method:"POST",headers:{"content-type":"application/json"},body:"{}"})
+            .then((response)=>process.exit(response.ok ? 0 : 1))
+            .catch(()=>process.exit(1));'
+      interval: 5s
+      timeout: 5s
+      retries: 12
     volumes:
       - shared_telemetry:/shared
     working_dir: /app
-    command: npm start
     networks:
       - iot-network
 
@@ -45,15 +58,15 @@ services:
     environment:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
+      - PUBLIC_ORIGIN=http://iot-db.localhost
     depends_on:
       iot-db:
         condition: service_healthy
       cadenza-db-service:
-        condition: service_started
+        condition: service_healthy
     volumes:
       - shared_telemetry:/shared
     working_dir: /app
-    command: npm start
     networks:
       - iot-network
 
@@ -66,17 +79,22 @@ services:
     environment:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
+      - PUBLIC_ORIGIN=http://telemetry-collector.localhost
     depends_on:
-      - cadenza-db-service
-      - iot-db-service
-      - anomaly-detector
-      - predictor
-      - alert-service
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
+      anomaly-detector:
+        condition: service_started
+      predictor:
+        condition: service_started
+      alert-service:
+        condition: service_started
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
     working_dir: /app
-    command: npm start
     networks:
       - iot-network
 
@@ -89,14 +107,16 @@ services:
     environment:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
+      - PUBLIC_ORIGIN=http://anomaly-detector.localhost
     depends_on:
-      - cadenza-db-service
-      - iot-db-service
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
     working_dir: /app
-    command: npm start
     networks:
       - iot-network
 
@@ -110,14 +130,16 @@ services:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
       - WEATHER_API_KEY=${WEATHER_API_KEY:-}
+      - PUBLIC_ORIGIN=http://predictor.localhost
     depends_on:
-      - cadenza-db-service
-      - iot-db-service
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
     working_dir: /app
-    command: npm start
     networks:
       - iot-network
 
@@ -130,14 +152,16 @@ services:
     environment:
       - CADENZA_DB_ADDRESS=cadenza-db-service
       - CADENZA_DB_PORT=8080
+      - PUBLIC_ORIGIN=http://alert-service.localhost
     depends_on:
-      - cadenza-db-service
-      - iot-db-service
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
     working_dir: /app
-    command: npm start
     networks:
       - iot-network
 
@@ -152,15 +176,103 @@ services:
       - CADENZA_DB_PORT=8080
       - TRAFFIC_MODE=low
       - DEVICE_COUNT=50
+      - CADENZA_INSTANCE_DEBUG=1
+      - CADENZA_SERVICE_REGISTRY_TRACE_SERVICE=ScheduledRunnerService
+      - CADENZA_SYNC_PHASE_TRACE_SERVICE=ScheduledRunnerService
     depends_on:
-      - cadenza-db-service
-      - iot-db-service
-      - telemetry-collector
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
+      telemetry-collector:
+        condition: service_started
     volumes:
       - shared_telemetry:/shared
       - ./scripts:/scripts:ro
     working_dir: /app
-    command: npm start
+    networks:
+      - iot-network
+
+  frontend:
+    container_name: demo-frontend
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    environment:
+      - CADENZA_DB_ADDRESS=cadenza-db-service
+      - CADENZA_DB_PORT=8080
+      - NUXT_PUBLIC_CADENZA_BOOTSTRAP_URL=http://cadenza-db.localhost:80
+      - NUXT_PUBLIC_APP_ORIGIN=http://frontend.localhost
+      - HOST=0.0.0.0
+      - PORT=3000
+      - NODE_ENV=production
+    depends_on:
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
+      telemetry-collector:
+        condition: service_started
+      anomaly-detector:
+        condition: service_started
+      predictor:
+        condition: service_started
+      alert-service:
+        condition: service_started
+      scheduled-runner:
+        condition: service_started
+    networks:
+      - iot-network
+
+  cadenza-ui:
+    container_name: cadenza-ui-console
+    build:
+      context: ..
+      dockerfile: cadenza-ui/Dockerfile
+      args:
+        VITE_CADENZA_DB_BOOTSTRAP_URL: http://cadenza-db.localhost:80
+    depends_on:
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
+      telemetry-collector:
+        condition: service_started
+      anomaly-detector:
+        condition: service_started
+      predictor:
+        condition: service_started
+      alert-service:
+        condition: service_started
+      scheduled-runner:
+        condition: service_started
+    networks:
+      - iot-network
+
+  edge:
+    build:
+      context: ./edge
+      dockerfile: Dockerfile
+    container_name: cadenza-demo-2-edge
+    depends_on:
+      frontend:
+        condition: service_started
+      cadenza-ui:
+        condition: service_started
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
+      telemetry-collector:
+        condition: service_started
+      anomaly-detector:
+        condition: service_started
+      predictor:
+        condition: service_started
+      alert-service:
+        condition: service_started
+    ports:
+      - "80:80"
     networks:
       - iot-network
 

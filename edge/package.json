@@ -1,0 +1,11 @@
+{
+  "name": "cadenza-demo-2-edge",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node index.mjs"
+  },
+  "dependencies": {
+    "http-proxy": "^1.18.1"
+  }
+}

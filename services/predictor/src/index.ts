@@ -1,12 +1,19 @@
 import Cadenza from "@cadenza.io/service";
+import { randomUUID } from "node:crypto";
 import {
-  IOT_INTENTS,
   IOT_DB_INTENTS,
+  IOT_INTENTS,
   IOT_SIGNALS,
   type PredictionResult,
   type DeviceReadings,
   type AnomalyResult,
 } from "./contracts.js";
+
+const publicOrigin =
+  process.env.PUBLIC_ORIGIN ?? "http://predictor.localhost";
+const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "predictor"}:${
+  process.env.HTTP_PORT ?? "3005"
+}`;
 
 type PredictionSessionState = {
   lastProbability: number;
@@ -46,8 +53,9 @@ const predictionSessionActor = Cadenza.createActor<PredictionSessionState>({
     lastComputedAt: null,
   },
   session: {
-    persistDurableState: true,
-    persistenceTimeoutMs: 5000,
+    // Keep demo session state runtime-only until actor-session hydration exists.
+    persistDurableState: false,
+    persistenceTimeoutMs: 30000,
   },
 });
 
@@ -68,6 +76,9 @@ const weatherRuntimeActor = Cadenza.createActor<
     persistDurableState: false,
   },
 });
+
+const PREDICTION_SESSION_PERSIST_SIGNAL =
+  "meta.demo.prediction.session_persist_requested";
 
 function clamp(value: number, min = 0, max = 1): number {
   if (value < min) return min;
@@ -146,6 +157,7 @@ const fetchWeatherTask = Cadenza.createTask(
         });
 
         return {
+          ...input,
           weatherData: state.weatherData,
           weatherCacheHit: true,
         };
@@ -197,6 +209,7 @@ const fetchWeatherTask = Cadenza.createTask(
       });
 
       return {
+        ...input,
         weatherData,
         weatherCacheHit: false,
       };
@@ -252,6 +265,15 @@ const computePredictionTask = Cadenza.createTask(
 
     return {
       ...ctx,
+      deviceId: predictionResult.deviceId,
+      timestamp: predictionResult.timestamp,
+      anomalyScore: predictionResult.riskFactors.anomalyScore,
+      failureProbability: predictionResult.failureProbability,
+      maintenanceNeeded: predictionResult.maintenanceNeeded,
+      predictedEta: predictionResult.predictedEta,
+      weatherCondition: predictionResult.riskFactors.weatherCondition,
+      weatherMultiplier: predictionResult.riskFactors.weatherMultiplier,
+      riskFactors: predictionResult.riskFactors,
       predictionResult,
     };
   },
@@ -262,36 +284,113 @@ const persistPredictionSessionTask = Cadenza.createTask(
   "Persist prediction session actor state",
   predictionSessionActor.task(
     ({ input, state, setState }) => {
+      const prediction =
+        input.predictionResult ??
+        (input.deviceId
+          ? {
+              deviceId: input.deviceId,
+              timestamp: input.timestamp,
+              failureProbability: input.failureProbability,
+              maintenanceNeeded: input.maintenanceNeeded,
+              predictedEta: input.predictedEta,
+              riskFactors:
+                input.riskFactors ??
+                (input.anomalyScore !== undefined
+                  ? {
+                      anomalyScore: input.anomalyScore,
+                      weatherCondition: input.weatherCondition ?? "neutral",
+                      weatherMultiplier: input.weatherMultiplier ?? 1,
+                    }
+                  : undefined),
+            }
+          : undefined);
+
+      if (!prediction) {
+        throw new Error("prediction result is required for session persistence");
+      }
+
       const nextState: PredictionSessionState = {
         ...state,
-        lastProbability: input.predictionResult.failureProbability,
-        lastPredictedEta: input.predictionResult.predictedEta,
-        lastRiskFactors: input.predictionResult.riskFactors,
-        lastAnomalyScore: input.predictionResult.riskFactors.anomalyScore,
+        lastProbability: prediction.failureProbability,
+        lastPredictedEta: prediction.predictedEta,
+        lastRiskFactors: prediction.riskFactors,
+        lastAnomalyScore: prediction.riskFactors.anomalyScore,
         computeCount: state.computeCount + 1,
-        lastComputedAt: input.predictionResult.timestamp,
+        lastComputedAt: prediction.timestamp,
       };
 
       setState(nextState);
 
-      return nextState;
+      return {
+        ...input,
+        anomalyScore: prediction.riskFactors.anomalyScore,
+        failureProbability: prediction.failureProbability,
+        maintenanceNeeded: prediction.maintenanceNeeded,
+        predictedEta: prediction.predictedEta,
+        weatherCondition: prediction.riskFactors.weatherCondition,
+        weatherMultiplier: prediction.riskFactors.weatherMultiplier,
+        predictionResult: prediction,
+        predictionSession: nextState,
+      };
     },
     { mode: "write" },
   ),
   "Writes latest prediction output to durable prediction session actor state.",
 );
 
+const requestPredictionSessionPersistenceTask = Cadenza.createTask(
+  "Request prediction session persistence",
+  (ctx: any, emit: any) => {
+    emit(PREDICTION_SESSION_PERSIST_SIGNAL, ctx);
+    return ctx;
+  },
+  "Detaches prediction session persistence from the inquiry-critical path.",
+);
+
 const prepareHealthMetricInsertTask = Cadenza.createTask(
   "Prepare health_metric insert payload",
   (ctx: any) => {
+    const prediction =
+      ctx.predictionResult ??
+      (ctx.deviceId
+        ? {
+            deviceId: ctx.deviceId,
+            timestamp: ctx.timestamp,
+            failureProbability: ctx.failureProbability,
+            maintenanceNeeded: ctx.maintenanceNeeded,
+            predictedEta: ctx.predictedEta,
+            riskFactors:
+              ctx.riskFactors ??
+              (ctx.anomalyScore !== undefined
+                ? {
+                    anomalyScore: ctx.anomalyScore,
+                    weatherCondition: ctx.weatherCondition ?? "neutral",
+                    weatherMultiplier: ctx.weatherMultiplier ?? 1,
+                  }
+                : undefined),
+          }
+        : undefined);
+
+    if (!prediction) {
+      throw new Error("prediction result is required for health_metric persistence");
+    }
+
+    const insertData = {
+      uuid: randomUUID(),
+      device_id: prediction.deviceId,
+      timestamp: prediction.timestamp,
+      anomaly_score: prediction.riskFactors?.anomalyScore ?? ctx.anomalyScore ?? 0,
+      failure_probability: prediction.failureProbability,
+      predicted_eta: prediction.predictedEta,
+    };
+
     return {
       ...ctx,
-      data: {
-        device_id: ctx.predictionResult.deviceId,
-        timestamp: ctx.predictionResult.timestamp,
-        anomaly_score: ctx.predictionResult.riskFactors.anomalyScore,
-        failure_probability: ctx.predictionResult.failureProbability,
-        predicted_eta: ctx.predictionResult.predictedEta,
+      predictionResult: prediction,
+      data: insertData,
+      queryData: {
+        ...(ctx.queryData ?? {}),
+        data: insertData,
       },
     };
   },
@@ -299,39 +398,94 @@ const prepareHealthMetricInsertTask = Cadenza.createTask(
 );
 
 const persistHealthMetricTask = Cadenza.createTask(
-  "Persist health_metric via iot-db intent",
+  "Persist health_metric via IoT DB intent",
   async (ctx: any, _emit: any, inquire: any) => {
-    await inquire(
-      IOT_DB_INTENTS.healthMetricInsert,
-      { data: ctx.data },
-      {
-        requireComplete: true,
-        rejectOnTimeout: true,
-        timeout: 10000,
-      },
-    );
+    const payload =
+      ctx.queryData ??
+      (ctx.data ? { data: ctx.data } : undefined) ??
+      ((ctx.predictionResult ?? ctx.deviceId)
+        ? {
+            data: {
+              uuid: randomUUID(),
+              device_id: ctx.predictionResult?.deviceId ?? ctx.deviceId,
+              timestamp: ctx.predictionResult?.timestamp ?? ctx.timestamp,
+              anomaly_score:
+                ctx.predictionResult?.riskFactors?.anomalyScore ??
+                ctx.riskFactors?.anomalyScore ??
+                ctx.anomalyScore ??
+                0,
+              failure_probability:
+                ctx.predictionResult?.failureProbability ??
+                ctx.failureProbability ??
+                0,
+              predicted_eta: ctx.predictionResult?.predictedEta ?? ctx.predictedEta,
+            },
+          }
+        : undefined);
+    const result = await inquire(IOT_DB_INTENTS.healthMetricInsert, payload, {
+      requireComplete: true,
+      rejectOnTimeout: true,
+      timeout: 10000,
+    });
 
-    return ctx;
+    return {
+      ...ctx,
+      ...(typeof result === "object" && result ? result : {}),
+    };
   },
-  "Persists health_metric row through canonical internal iot-db insert intent.",
+  "Persists health_metric rows through the generated IoT DB insert intent.",
 );
 
 const emitPredictionSignalTask = Cadenza.createTask(
   "Emit canonical prediction signal",
   (ctx: any, emit: any) => {
-    const signalName = ctx.predictionResult.maintenanceNeeded
+    const prediction =
+      ctx.predictionResult ??
+      (ctx.deviceId
+        ? {
+            deviceId: ctx.deviceId,
+            timestamp: ctx.timestamp,
+            failureProbability: ctx.failureProbability,
+            maintenanceNeeded: ctx.maintenanceNeeded,
+            predictedEta: ctx.predictedEta,
+            riskFactors:
+              ctx.riskFactors ??
+              (ctx.anomalyScore !== undefined
+                ? {
+                    anomalyScore: ctx.anomalyScore,
+                    weatherCondition: ctx.weatherCondition ?? "neutral",
+                    weatherMultiplier: ctx.weatherMultiplier ?? 1,
+                  }
+                : undefined),
+          }
+        : undefined);
+
+    if (!prediction) {
+      throw new Error("prediction result is required for signal emission");
+    }
+
+    const signalName = prediction.maintenanceNeeded
       ? IOT_SIGNALS.predictionMaintenanceNeeded
       : IOT_SIGNALS.predictionReady;
 
     emit(signalName, {
-      ...ctx.predictionResult,
-      severity: toSeverity(ctx.predictionResult.failureProbability),
-      reason: ctx.predictionResult.maintenanceNeeded
+      ...prediction,
+      severity: toSeverity(prediction.failureProbability),
+      reason: prediction.maintenanceNeeded
         ? "Failure probability exceeded maintenance threshold"
         : "Prediction computed below maintenance threshold",
     });
 
-    return ctx;
+    return {
+      ...ctx,
+      anomalyScore: prediction.riskFactors.anomalyScore,
+      failureProbability: prediction.failureProbability,
+      maintenanceNeeded: prediction.maintenanceNeeded,
+      predictedEta: prediction.predictedEta,
+      weatherCondition: prediction.riskFactors.weatherCondition,
+      weatherMultiplier: prediction.riskFactors.weatherMultiplier,
+      predictionResult: prediction,
+    };
   },
   "Emits canonical prediction-ready or maintenance-needed signal after persistence.",
 ).attachSignal(IOT_SIGNALS.predictionReady, IOT_SIGNALS.predictionMaintenanceNeeded);
@@ -339,23 +493,49 @@ const emitPredictionSignalTask = Cadenza.createTask(
 const finalizePredictionResponseTask = Cadenza.createTask(
   "Finalize prediction compute response",
   (ctx: any) => {
+    const prediction =
+      ctx.predictionResult ??
+      (ctx.deviceId
+        ? {
+            deviceId: ctx.deviceId,
+            timestamp: ctx.timestamp,
+            failureProbability: ctx.failureProbability,
+            maintenanceNeeded: ctx.maintenanceNeeded,
+            predictedEta: ctx.predictedEta,
+            riskFactors:
+              ctx.riskFactors ??
+              (ctx.anomalyScore !== undefined
+                ? {
+                    anomalyScore: ctx.anomalyScore,
+                    weatherCondition: ctx.weatherCondition ?? "neutral",
+                    weatherMultiplier: ctx.weatherMultiplier ?? 1,
+                  }
+                : undefined),
+          }
+        : undefined);
+
+    if (!prediction) {
+      throw new Error("prediction result is required for finalize response");
+    }
+
     return {
       __success: true,
-      ...ctx.predictionResult,
+      ...prediction,
     };
   },
   "Builds canonical iot-prediction-compute response payload.",
 );
 
-normalizePredictionInputTask
-  .then(fetchWeatherTask)
-  .then(computePredictionTask)
-  .then(persistPredictionSessionTask)
-  .then(prepareHealthMetricInsertTask)
-  .then(persistHealthMetricTask)
-  .then(emitPredictionSignalTask)
-  .then(finalizePredictionResponseTask)
-  .respondsTo(IOT_INTENTS.predictionCompute);
+normalizePredictionInputTask.then(fetchWeatherTask);
+fetchWeatherTask.then(computePredictionTask);
+computePredictionTask.then(requestPredictionSessionPersistenceTask);
+requestPredictionSessionPersistenceTask.then(prepareHealthMetricInsertTask);
+prepareHealthMetricInsertTask.then(persistHealthMetricTask);
+persistHealthMetricTask.then(emitPredictionSignalTask);
+emitPredictionSignalTask.then(finalizePredictionResponseTask);
+normalizePredictionInputTask.respondsTo(IOT_INTENTS.predictionCompute);
+
+persistPredictionSessionTask.doOn(PREDICTION_SESSION_PERSIST_SIGNAL);
 
 Cadenza.createTask(
   "Compute prediction from anomaly signal",
@@ -400,15 +580,23 @@ Cadenza.createCadenzaService(
   "PredictorService",
   "Computes canonical failure predictions and persists health_metric outputs.",
   {
+    useSocket: false,
     cadenzaDB: {
       connect: true,
       address: process.env.CADENZA_DB_ADDRESS ?? "cadenza-db-service",
       port: parseInt(process.env.CADENZA_DB_PORT ?? "8080", 10),
     },
+    transports: [
+      {
+        role: "internal",
+        origin: internalOrigin,
+        protocols: ["rest"],
+      },
+      {
+        role: "public",
+        origin: publicOrigin,
+        protocols: ["rest"],
+      },
+    ],
   },
 );
-
-process.on("SIGTERM", () => {
-  Cadenza.log("Predictor Service shutting down gracefully.");
-  process.exit(0);
-});

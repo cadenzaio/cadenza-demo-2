@@ -5,8 +5,6 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 COPY package-lock.json ./
-
-# Install dependencies including TypeScript
 RUN npm ci
 
 # Copy source code and tsconfig

@@ -1,12 +1,19 @@
 import Cadenza from "@cadenza.io/service";
+import { randomUUID } from "node:crypto";
 import {
-  IOT_INTENTS,
   IOT_DB_INTENTS,
+  IOT_INTENTS,
   IOT_SIGNALS,
   type PredictionResult,
   type TelemetryIngestPayload,
   type AnomalyResult,
 } from "./contracts.js";
+
+const publicOrigin =
+  process.env.PUBLIC_ORIGIN ?? "http://telemetry-collector.localhost";
+const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "telemetry-collector"}:${
+  process.env.HTTP_PORT ?? "3003"
+}`;
 
 type TelemetrySessionState = {
   lastTelemetry: TelemetryIngestPayload | null;
@@ -15,6 +22,10 @@ type TelemetrySessionState = {
   lastAnomaly: AnomalyResult | null;
   lastPrediction: PredictionResult | null;
   lastIngestedAt: string | null;
+};
+
+type InquiryErrorDetails = {
+  values: string[];
 };
 
 const telemetrySessionActor = Cadenza.createActor<TelemetrySessionState>({
@@ -33,10 +44,79 @@ const telemetrySessionActor = Cadenza.createActor<TelemetrySessionState>({
     lastIngestedAt: null,
   },
   session: {
-    persistDurableState: true,
-    persistenceTimeoutMs: 5000,
+    // Durable actor hydration is not available yet, so persisted rows from
+    // previous runs can reject fresh writes after restart via stale versions.
+    persistDurableState: false,
+    persistenceTimeoutMs: 30000,
   },
 });
+
+const TELEMETRY_SESSION_INGEST_PERSIST_SIGNAL =
+  "meta.demo.telemetry.session_ingest_persist_requested";
+const TELEMETRY_SESSION_ANALYSIS_PERSIST_SIGNAL =
+  "meta.demo.telemetry.session_analysis_persist_requested";
+
+function describeInquiryError(error: unknown): InquiryErrorDetails {
+  const values: string[] = [];
+  const seen = new Set<unknown>();
+
+  const collect = (value: unknown, depth = 3) => {
+    if (depth < 0 || value === null || value === undefined) {
+      return;
+    }
+
+    if (typeof value === "string") {
+      values.push(value);
+      return;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      values.push(String(value));
+      return;
+    }
+
+    if (typeof value !== "object" || seen.has(value)) {
+      return;
+    }
+
+    seen.add(value);
+
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      collect(nested, depth - 1);
+    }
+  };
+
+  collect(error);
+
+  if (values.length === 0) {
+    values.push(String(error));
+  }
+
+  return { values };
+}
+
+function isManagedIotDbRecoveryError(error: unknown): boolean {
+  const details = describeInquiryError(error);
+  const values = details.values.join(" | ");
+
+  return (
+    values.includes("No routeable internal transport available") &&
+    values.includes("Waiting for authority route updates before retrying")
+  );
+}
+
+function isManagedPredictionRecoveryError(error: unknown): boolean {
+  const details = describeInquiryError(error);
+  const values = details.values.join(" | ");
+
+  return (
+    values.includes(IOT_INTENTS.predictionCompute) ||
+    values.includes("PredictorService") ||
+    values.includes("No routeable internal transport available") ||
+    values.includes("Waiting for authority route updates before retrying") ||
+    values.includes("ECONNREFUSED")
+  );
+}
 
 const normalizeIngestPayloadTask = Cadenza.createTask(
   "Normalize telemetry ingest payload",
@@ -107,6 +187,7 @@ const recordTelemetryIngestTask = Cadenza.createTask(
       });
 
       return {
+        ...input,
         validationCount: nextValidationCount,
         outlierCount: nextOutlierCount,
       };
@@ -116,20 +197,41 @@ const recordTelemetryIngestTask = Cadenza.createTask(
   "Updates durable telemetry session actor with current ingest payload counters.",
 );
 
+const requestTelemetryIngestSessionPersistenceTask = Cadenza.createTask(
+  "Request telemetry ingest session persistence",
+  (ctx: any, emit: any) => {
+    emit(TELEMETRY_SESSION_INGEST_PERSIST_SIGNAL, ctx);
+    return ctx;
+  },
+  "Detaches telemetry ingest session persistence from the inquiry-critical path.",
+);
+
 const prepareTelemetryInsertTask = Cadenza.createTask(
   "Prepare telemetry insert payload",
   (ctx: any) => {
     const payload: TelemetryIngestPayload = ctx.telemetryPayload;
+    const insertData = {
+      uuid: randomUUID(),
+      device_id: payload.deviceId,
+      timestamp: payload.timestamp,
+      temperature: payload.readings.temperature,
+      humidity: payload.readings.humidity,
+      battery: payload.readings.battery,
+      raw_json: payload,
+    };
 
     return {
       ...ctx,
-      data: {
-        device_id: payload.deviceId,
-        timestamp: payload.timestamp,
-        temperature: payload.readings.temperature,
-        humidity: payload.readings.humidity,
-        battery: payload.readings.battery,
-        raw_json: payload,
+      data: insertData,
+      queryData: {
+        ...(ctx.queryData ?? {}),
+        data: insertData,
+        onConflict: {
+          target: ["device_id", "timestamp"],
+          action: {
+            do: "nothing",
+          },
+        },
       },
     };
   },
@@ -137,26 +239,78 @@ const prepareTelemetryInsertTask = Cadenza.createTask(
 );
 
 const persistTelemetryTask = Cadenza.createTask(
-  "Persist telemetry via iot-db intent",
+  "Persist telemetry via IoT DB intent",
   async (ctx: any, _emit: any, inquire: any) => {
-    await inquire(
-      IOT_DB_INTENTS.telemetryInsert,
-      { data: ctx.data },
-      {
+    const payload =
+      ctx.queryData ??
+      (ctx.data ? { data: ctx.data } : undefined) ??
+      (ctx.telemetryPayload
+        ? {
+            data: {
+              uuid: randomUUID(),
+              device_id: ctx.telemetryPayload.deviceId,
+              timestamp: ctx.telemetryPayload.timestamp,
+              temperature: ctx.telemetryPayload.readings.temperature,
+              humidity: ctx.telemetryPayload.readings.humidity,
+              battery: ctx.telemetryPayload.readings.battery,
+              raw_json: ctx.telemetryPayload,
+            },
+            onConflict: {
+              target: ["device_id", "timestamp"],
+              action: {
+                do: "nothing",
+              },
+            },
+          }
+        : undefined);
+    let result: any;
+
+    try {
+      result = await inquire(IOT_DB_INTENTS.telemetryInsert, payload, {
         requireComplete: true,
         rejectOnTimeout: true,
         timeout: 10000,
-      },
-    );
+      });
+    } catch (error) {
+      if (isManagedIotDbRecoveryError(error)) {
+        return {
+          ...ctx,
+          iotDbPersistenceDeferred: true,
+          deferredReason: "iot_db_route_recovering",
+        };
+      }
 
-    return ctx;
+      throw error;
+    }
+
+    if (
+      result &&
+      typeof result === "object" &&
+      (result.errored === true || result.failed === true) &&
+      isManagedIotDbRecoveryError(result)
+    ) {
+      return {
+        ...ctx,
+        iotDbPersistenceDeferred: true,
+        deferredReason: "iot_db_route_recovering",
+      };
+    }
+
+    return {
+      ...ctx,
+      ...(typeof result === "object" && result ? result : {}),
+    };
   },
-  "Persists telemetry row through canonical internal iot-db insert intent.",
+  "Persists telemetry rows through the generated IoT DB insert intent.",
 );
 
 const emitTelemetryIngestedSignalTask = Cadenza.createTask(
   "Emit telemetry ingested signal",
   (ctx: any, emit: any) => {
+    if (ctx.iotDbPersistenceDeferred) {
+      return ctx;
+    }
+
     emit(IOT_SIGNALS.telemetryIngested, {
       deviceId: ctx.deviceId,
       timestamp: ctx.timestamp,
@@ -173,6 +327,13 @@ const emitTelemetryIngestedSignalTask = Cadenza.createTask(
 const detectAnomalyTask = Cadenza.createTask(
   "Detect anomaly via intent",
   async (ctx: any, emit: any, inquire: any) => {
+    if (ctx.iotDbPersistenceDeferred) {
+      return {
+        ...ctx,
+        anomalyResult: null,
+      };
+    }
+
     const anomalyResponse = (await inquire(
       IOT_INTENTS.anomalyDetect,
       {
@@ -225,20 +386,42 @@ const detectAnomalyTask = Cadenza.createTask(
 const computePredictionTask = Cadenza.createTask(
   "Compute prediction via intent",
   async (ctx: any, _emit: any, inquire: any) => {
-    const predictionResult = (await inquire(
-      IOT_INTENTS.predictionCompute,
-      {
-        deviceId: ctx.deviceId,
-        timestamp: ctx.timestamp,
-        readings: ctx.readings,
-        anomalyResult: ctx.anomalyResult,
-      },
-      {
-        requireComplete: true,
-        rejectOnTimeout: true,
-        timeout: 10000,
-      },
-    )) as PredictionResult & { __success?: boolean };
+    if (ctx.iotDbPersistenceDeferred) {
+      return {
+        ...ctx,
+        predictionResult: null,
+      };
+    }
+
+    let predictionResult: PredictionResult & { __success?: boolean };
+
+    try {
+      predictionResult = (await inquire(
+        IOT_INTENTS.predictionCompute,
+        {
+          deviceId: ctx.deviceId,
+          timestamp: ctx.timestamp,
+          readings: ctx.readings,
+          anomalyResult: ctx.anomalyResult,
+        },
+        {
+          requireComplete: true,
+          rejectOnTimeout: true,
+          timeout: 10000,
+        },
+      )) as PredictionResult & { __success?: boolean };
+    } catch (error) {
+      if (isManagedPredictionRecoveryError(error)) {
+        return {
+          ...ctx,
+          predictionResult: null,
+          predictionDeferred: true,
+          predictionDeferredReason: "predictor_route_recovering",
+        };
+      }
+
+      throw error;
+    }
 
     return {
       ...ctx,
@@ -259,6 +442,7 @@ const recordTelemetryAnalysisTask = Cadenza.createTask(
       });
 
       return {
+        ...input,
         lastAnomaly: input.anomalyResult ?? state.lastAnomaly,
         lastPrediction: input.predictionResult ?? state.lastPrediction,
       };
@@ -268,9 +452,35 @@ const recordTelemetryAnalysisTask = Cadenza.createTask(
   "Persists latest anomaly/prediction outcomes for telemetry session actor.",
 );
 
+const requestTelemetryAnalysisSessionPersistenceTask = Cadenza.createTask(
+  "Request telemetry analysis session persistence",
+  (ctx: any, emit: any) => {
+    if (ctx.iotDbPersistenceDeferred) {
+      return ctx;
+    }
+
+    emit(TELEMETRY_SESSION_ANALYSIS_PERSIST_SIGNAL, ctx);
+    return ctx;
+  },
+  "Detaches telemetry analysis session persistence from the inquiry-critical path.",
+);
+
 const finalizeTelemetryIngestTask = Cadenza.createTask(
   "Finalize telemetry ingest response",
   (ctx: any) => {
+    if (ctx.iotDbPersistenceDeferred) {
+      return {
+        __success: true,
+        ingested: false,
+        deferred: true,
+        deferredReason: ctx.deferredReason ?? "iot_db_route_recovering",
+        deviceId: ctx.deviceId,
+        timestamp: ctx.timestamp,
+        anomaly: null,
+        prediction: null,
+      };
+    }
+
     return {
       __success: true,
       ingested: true,
@@ -283,16 +493,18 @@ const finalizeTelemetryIngestTask = Cadenza.createTask(
   "Builds canonical iot-telemetry-ingest response payload.",
 );
 
-normalizeIngestPayloadTask
-  .then(recordTelemetryIngestTask)
-  .then(prepareTelemetryInsertTask)
-  .then(persistTelemetryTask)
-  .then(emitTelemetryIngestedSignalTask)
-  .then(detectAnomalyTask)
-  .then(computePredictionTask)
-  .then(recordTelemetryAnalysisTask)
-  .then(finalizeTelemetryIngestTask)
-  .respondsTo(IOT_INTENTS.telemetryIngest);
+normalizeIngestPayloadTask.then(requestTelemetryIngestSessionPersistenceTask);
+requestTelemetryIngestSessionPersistenceTask.then(prepareTelemetryInsertTask);
+prepareTelemetryInsertTask.then(persistTelemetryTask);
+persistTelemetryTask.then(emitTelemetryIngestedSignalTask);
+emitTelemetryIngestedSignalTask.then(detectAnomalyTask);
+detectAnomalyTask.then(computePredictionTask);
+computePredictionTask.then(requestTelemetryAnalysisSessionPersistenceTask);
+requestTelemetryAnalysisSessionPersistenceTask.then(finalizeTelemetryIngestTask);
+normalizeIngestPayloadTask.respondsTo(IOT_INTENTS.telemetryIngest);
+
+recordTelemetryIngestTask.doOn(TELEMETRY_SESSION_INGEST_PERSIST_SIGNAL);
+recordTelemetryAnalysisTask.doOn(TELEMETRY_SESSION_ANALYSIS_PERSIST_SIGNAL);
 
 Cadenza.createTask(
   "Get telemetry session state",
@@ -311,15 +523,23 @@ Cadenza.createCadenzaService(
   "TelemetryCollectorService",
   "Accepts canonical telemetry ingest requests and orchestrates anomaly/prediction flow.",
   {
+    useSocket: false,
     cadenzaDB: {
       connect: true,
       address: process.env.CADENZA_DB_ADDRESS ?? "cadenza-db-service",
       port: parseInt(process.env.CADENZA_DB_PORT ?? "8080", 10),
     },
+    transports: [
+      {
+        role: "internal",
+        origin: internalOrigin,
+        protocols: ["rest"],
+      },
+      {
+        role: "public",
+        origin: publicOrigin,
+        protocols: ["rest"],
+      },
+    ],
   },
 );
-
-process.on("SIGTERM", () => {
-  Cadenza.log("Telemetry Collector shutting down gracefully.");
-  process.exit(0);
-});
