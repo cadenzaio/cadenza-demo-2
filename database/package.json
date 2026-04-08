@@ -8,9 +8,9 @@
     "build": "tsc"
   },
   "dependencies": {
-    "@cadenza.io/cadenza-db": "^2.11.0",
-    "@cadenza.io/core": "^3.26.0",
-    "@cadenza.io/service": "^2.19.0",
+    "@cadenza.io/cadenza-db": "^2.11.1",
+    "@cadenza.io/core": "^3.26.1",
+    "@cadenza.io/service": "^2.19.1",
     "typescript": "^5.3.3"
   },
   "devDependencies": {
