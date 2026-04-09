@@ -224,31 +224,6 @@ services:
     networks:
       - iot-network
 
-  cadenza-ui:
-    container_name: cadenza-ui-console
-    build:
-      context: ..
-      dockerfile: cadenza-ui/Dockerfile
-      args:
-        VITE_CADENZA_DB_BOOTSTRAP_URL: http://cadenza-db.localhost:80
-    depends_on:
-      cadenza-db-service:
-        condition: service_healthy
-      iot-db-service:
-        condition: service_started
-      telemetry-collector:
-        condition: service_started
-      anomaly-detector:
-        condition: service_started
-      predictor:
-        condition: service_started
-      alert-service:
-        condition: service_started
-      scheduled-runner:
-        condition: service_started
-    networks:
-      - iot-network
-
   edge:
     build:
       context: ./edge
@@ -256,8 +231,6 @@ services:
     container_name: cadenza-demo-2-edge
     depends_on:
       frontend:
-        condition: service_started
-      cadenza-ui:
         condition: service_started
       cadenza-db-service:
         condition: service_healthy
