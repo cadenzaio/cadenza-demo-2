@@ -53,8 +53,7 @@ const predictionSessionActor = Cadenza.createActor<PredictionSessionState>({
     lastComputedAt: null,
   },
   session: {
-    // Keep demo session state runtime-only until actor-session hydration exists.
-    persistDurableState: false,
+    persistDurableState: true,
     persistenceTimeoutMs: 30000,
   },
 });

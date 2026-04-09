@@ -44,9 +44,7 @@ const telemetrySessionActor = Cadenza.createActor<TelemetrySessionState>({
     lastIngestedAt: null,
   },
   session: {
-    // Durable actor hydration is not available yet, so persisted rows from
-    // previous runs can reject fresh writes after restart via stale versions.
-    persistDurableState: false,
+    persistDurableState: true,
     persistenceTimeoutMs: 30000,
   },
 });

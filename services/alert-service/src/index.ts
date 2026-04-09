@@ -61,8 +61,7 @@ const alertSessionActor = Cadenza.createActor<AlertSessionState>({
     dedupeCount: 0,
   },
   session: {
-    // Keep demo session state runtime-only until actor-session hydration exists.
-    persistDurableState: false,
+    persistDurableState: true,
     persistenceTimeoutMs: 30000,
   },
 });

@@ -143,9 +143,14 @@ docker-compose logs -f
 ## Local Debug Workflow
 
 - The releaseable default is published packages from npm:
-  - `@cadenza.io/core ^3.26.0`
-  - `@cadenza.io/service ^2.19.0`
-  - `@cadenza.io/cadenza-db ^2.11.0`
+  - `@cadenza.io/core ^3.26.1`
+  - `@cadenza.io/service ^2.19.1`
+  - `@cadenza.io/cadenza-db ^2.11.1`
+- Release verification should prove all three layers of truth from the workspace root:
+  - `python3 scripts/release_sync.py scan`
+  - confirm demo package manifests show `matches-npm`
+  - confirm lockfiles resolve to `published-source`
+  - confirm installed packages either `match-lockfile` or are intentionally not installed yet
 - For cross-repo debugging, the local tarball helper scripts can still temporarily rewrite package refs and hydrate ignored `vendor/` folders:
   - use `node scripts/local-cadenza-core.mjs sync` to rebuild and repack the sibling `cadenza` repo, refresh all demo `vendor/` copies, and refresh installed `node_modules` when present
   - use `node scripts/local-cadenza-core.mjs verify` to confirm vendored core tarballs and lockfiles still match the source tarball
@@ -153,6 +158,7 @@ docker-compose logs -f
   - use `node scripts/local-cadenza-service.mjs sync` to rebuild and repack the sibling `cadenza-service` repo, refresh all demo `vendor/` copies, and refresh installed `node_modules` when present
   - use `node scripts/local-cadenza-service.mjs verify` to confirm vendored tarballs and lockfiles still match the source tarball
   - use `node scripts/local-cadenza-service.mjs rebuild <service>` when you want the guarded sync plus a targeted Docker rebuild
+  - restore published package refs before merge or release verification; local tarballs are a debug detour, not the committed default
 - Prefer the lowest-cost reproduction that can still prove the point:
   - if a flow is identical across services, iterate on `cadenza-db-service` plus one representative service first
   - do not rebuild the full stack unless the narrow fix is already proven
