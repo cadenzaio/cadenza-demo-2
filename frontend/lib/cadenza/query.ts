@@ -3,6 +3,7 @@ import type {
   AlertRow,
   DeviceRow,
   HealthMetricRow,
+  RunnerStatus,
   TelemetryRow,
 } from "./contracts";
 
@@ -153,6 +154,27 @@ export function normalizeAlertRow(raw: AnyRecord | null | undefined): AlertRow {
     severity,
     reason: readString(row.reason) ?? "No reason provided",
     resolved: Boolean(row.resolved),
+  };
+}
+
+export function normalizeRunnerStatus(
+  raw: AnyRecord | null | undefined,
+): RunnerStatus | null {
+  const row = asRecord(raw);
+  const trafficMode = readString(row.trafficMode);
+  if (trafficMode !== "low" && trafficMode !== "high") {
+    return null;
+  }
+
+  return {
+    tickCount: Math.max(0, Math.trunc(readNumber(row.tickCount) ?? 0)),
+    totalEventsEmitted: Math.max(
+      0,
+      Math.trunc(readNumber(row.totalEventsEmitted) ?? 0),
+    ),
+    lastDelayMs: Math.max(0, Math.trunc(readNumber(row.lastDelayMs) ?? 0)),
+    lastBurstCount: Math.max(0, Math.trunc(readNumber(row.lastBurstCount) ?? 0)),
+    trafficMode,
   };
 }
 

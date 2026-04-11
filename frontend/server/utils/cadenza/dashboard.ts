@@ -1,5 +1,6 @@
 import type { HydrationOptions, SSRInquiryBridge } from "@cadenza.io/service";
 import {
+  IOT_INTENTS,
   IOT_DB_QUERY_INTENTS,
   type AlertRow,
   type DashboardPageData,
@@ -15,6 +16,7 @@ import {
   normalizeAlertRow,
   normalizeDeviceRow,
   normalizeHealthMetricRow,
+  normalizeRunnerStatus,
   normalizeTelemetryRow,
 } from "../../../lib/cadenza/query";
 import { createDemoSSRBridge, type DemoSSRBridgeConfig } from "./bridge";
@@ -63,6 +65,7 @@ export async function loadDashboardPageDataServer(
     telemetryRowsResult,
     healthMetricRowsResult,
     alertRowsResult,
+    runnerStatusResult,
   ] = await Promise.all([
     safeInquire(
       bridge,
@@ -135,6 +138,12 @@ export async function loadDashboardPageDataServer(
       },
       DASHBOARD_HYDRATION_KEYS.alertRows,
     ),
+    safeInquire(
+      bridge,
+      IOT_INTENTS.runnerTrafficRuntimeGet,
+      {},
+      "dashboard:runner-status",
+    ),
   ]);
 
   const data = buildDashboardPageData({
@@ -156,7 +165,9 @@ export async function loadDashboardPageDataServer(
     recentAlerts: extractRows<AlertRow>(alertRowsResult, ["alerts", "alertRows"]).map(
       normalizeAlertRow,
     ),
-    runnerStatus: null,
+    runnerStatus: normalizeRunnerStatus(
+      runnerStatusResult as Record<string, unknown> | null | undefined,
+    ),
   });
 
   return {

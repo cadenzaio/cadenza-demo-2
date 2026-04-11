@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildDashboardPageData } from "../lib/cadenza/dashboard";
+import { normalizeRunnerStatus } from "../lib/cadenza/query";
 
 describe("dashboard data builder", () => {
   it("combines counts and recent rows into device summaries", () => {
@@ -51,5 +52,23 @@ describe("dashboard data builder", () => {
       openAlertCount: 1,
     });
     expect(data.liveFeedSeed.length).toBeGreaterThan(0);
+  });
+
+  it("normalizes runner runtime payloads for dashboard rendering", () => {
+    expect(
+      normalizeRunnerStatus({
+        tickCount: 48,
+        totalEventsEmitted: 59,
+        lastDelayMs: 13695,
+        lastBurstCount: 3,
+        trafficMode: "low",
+      }),
+    ).toEqual({
+      tickCount: 48,
+      totalEventsEmitted: 59,
+      lastDelayMs: 13695,
+      lastBurstCount: 3,
+      trafficMode: "low",
+    });
   });
 });

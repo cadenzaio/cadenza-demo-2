@@ -5,6 +5,9 @@ const stateStore = new Map<string, { value: any }>();
 
 vi.mock("nuxt/app", () => ({
   defineNuxtPlugin,
+  onNuxtReady: (callback: () => void) => {
+    callback();
+  },
   useState: (key: string, init: () => unknown) => {
     if (!stateStore.has(key)) {
       stateStore.set(key, { value: init() });

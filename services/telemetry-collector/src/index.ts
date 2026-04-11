@@ -14,6 +14,13 @@ const publicOrigin =
 const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "telemetry-collector"}:${
   process.env.HTTP_PORT ?? "3003"
 }`;
+const META_ACTOR_SESSION_STATE_HYDRATE_INTENT = "meta-actor-session-state-hydrate";
+const META_ACTOR_SESSION_STATE_PERSIST_INTENT = "meta-actor-session-state-persist";
+const TELEMETRY_SESSION_PERSIST_TIMEOUT_MS = 10_000;
+const TELEMETRY_SESSION_RETRY_BASE_MS = 1_000;
+const TELEMETRY_SESSION_RETRY_MAX_MS = 30_000;
+const TELEMETRY_SESSION_ACTOR_NAME = "TelemetrySessionActor";
+const TELEMETRY_SESSION_ACTOR_VERSION = 1;
 
 type TelemetrySessionState = {
   lastTelemetry: TelemetryIngestPayload | null;
@@ -28,7 +35,37 @@ type InquiryErrorDetails = {
   values: string[];
 };
 
-const telemetrySessionActor = Cadenza.createActor<TelemetrySessionState>({
+type TelemetrySessionRuntimeState = TelemetrySessionState & {
+  __hydrated: boolean;
+  __durableVersion: number;
+  __persistenceDeferred: boolean;
+  __lastPersistenceError: string | null;
+};
+
+type PendingTelemetrySessionFlush = {
+  deviceId: string;
+  durableState: TelemetrySessionState;
+  durableVersion: number;
+  retryDelayMs: number;
+  inFlight: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+};
+
+type CadenzaInquiry = (
+  inquiryName: string,
+  context: Record<string, unknown>,
+  options: any,
+) => Promise<any>;
+
+const hydratedTelemetrySessionKeys = new Set<string>();
+const pendingTelemetrySessionHydrations = new Map<
+  string,
+  Promise<TelemetrySessionRuntimeState>
+>();
+const pendingTelemetrySessionFlushes = new Map<string, PendingTelemetrySessionFlush>();
+let latestTelemetrySessionInquire: CadenzaInquiry | null = null;
+
+const telemetrySessionActor = Cadenza.createActor<TelemetrySessionRuntimeState>({
   name: "TelemetrySessionActor",
   description:
     "Per-device durable telemetry session state used for demo observability and recovery.",
@@ -42,17 +79,158 @@ const telemetrySessionActor = Cadenza.createActor<TelemetrySessionState>({
     lastAnomaly: null,
     lastPrediction: null,
     lastIngestedAt: null,
+    __hydrated: false,
+    __durableVersion: 0,
+    __persistenceDeferred: false,
+    __lastPersistenceError: null,
   },
   session: {
-    persistDurableState: true,
-    persistenceTimeoutMs: 30000,
+    persistDurableState: false,
   },
 });
 
-const TELEMETRY_SESSION_INGEST_PERSIST_SIGNAL =
-  "meta.demo.telemetry.session_ingest_persist_requested";
-const TELEMETRY_SESSION_ANALYSIS_PERSIST_SIGNAL =
-  "meta.demo.telemetry.session_analysis_persist_requested";
+function buildDefaultTelemetrySessionState(): TelemetrySessionState {
+  return {
+    lastTelemetry: null,
+    validationCount: 0,
+    outlierCount: 0,
+    lastAnomaly: null,
+    lastPrediction: null,
+    lastIngestedAt: null,
+  };
+}
+
+function sanitizeTelemetryPayload(payload: unknown): TelemetryIngestPayload | null {
+  if (!payload || typeof payload !== "object") {
+    return null;
+  }
+
+  const value = payload as Record<string, any>;
+  const readings = value.readings ?? {};
+
+  const deviceId =
+    typeof value.deviceId === "string" ? value.deviceId : "";
+  const timestamp =
+    typeof value.timestamp === "string" ? value.timestamp : "";
+  const temperature = Number(readings.temperature);
+  const humidity = Number(readings.humidity);
+  const battery = Number(readings.battery);
+
+  if (
+    !deviceId ||
+    !timestamp ||
+    !Number.isFinite(temperature) ||
+    !Number.isFinite(humidity) ||
+    !Number.isFinite(battery)
+  ) {
+    return null;
+  }
+
+  return {
+    deviceId,
+    timestamp,
+    readings: {
+      temperature,
+      humidity,
+      battery,
+    },
+    source: "scheduler",
+    trafficMode: value.trafficMode === "high" ? "high" : "low",
+  };
+}
+
+function sanitizeAnomalyResult(result: unknown): AnomalyResult | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+
+  const value = result as Record<string, any>;
+
+  return {
+    deviceId: String(value.deviceId ?? ""),
+    timestamp: String(value.timestamp ?? ""),
+    anomalyDetected: Boolean(value.anomalyDetected),
+    anomalyScore: Number(value.anomalyScore ?? 0),
+    reason: String(value.reason ?? "No anomaly"),
+    metrics: {
+      temperature: {
+        score: Number(value.metrics?.temperature?.score ?? 0),
+        zScore: Number(value.metrics?.temperature?.zScore ?? 0),
+        anomalous: Boolean(value.metrics?.temperature?.anomalous),
+      },
+      humidity: {
+        score: Number(value.metrics?.humidity?.score ?? 0),
+        zScore: Number(value.metrics?.humidity?.zScore ?? 0),
+        anomalous: Boolean(value.metrics?.humidity?.anomalous),
+      },
+    },
+  };
+}
+
+function sanitizePredictionResult(result: unknown): PredictionResult | null {
+  if (!result || typeof result !== "object") {
+    return null;
+  }
+
+  const value = result as Record<string, any>;
+
+  return {
+    deviceId: String(value.deviceId ?? ""),
+    timestamp: String(value.timestamp ?? ""),
+    failureProbability: Number(value.failureProbability ?? 0),
+    maintenanceNeeded: Boolean(value.maintenanceNeeded),
+    predictedEta: String(value.predictedEta ?? ""),
+    riskFactors: {
+      anomalyScore: Number(value.riskFactors?.anomalyScore ?? 0),
+      weatherCondition: String(value.riskFactors?.weatherCondition ?? "unknown"),
+      weatherMultiplier: Number(value.riskFactors?.weatherMultiplier ?? 1),
+    },
+  };
+}
+
+function createTelemetrySessionRuntimeState(
+  state: Partial<TelemetrySessionState> | null | undefined,
+  durableVersion = 0,
+  options: Partial<
+    Pick<
+      TelemetrySessionRuntimeState,
+      "__hydrated" | "__persistenceDeferred" | "__lastPersistenceError"
+    >
+  > = {},
+): TelemetrySessionRuntimeState {
+  const base = buildDefaultTelemetrySessionState();
+
+  return {
+    ...base,
+    ...(state ?? {}),
+    lastTelemetry: sanitizeTelemetryPayload(state?.lastTelemetry) ?? null,
+    lastAnomaly: sanitizeAnomalyResult(state?.lastAnomaly) ?? null,
+    lastPrediction: sanitizePredictionResult(state?.lastPrediction) ?? null,
+    validationCount: Number(state?.validationCount ?? base.validationCount),
+    outlierCount: Number(state?.outlierCount ?? base.outlierCount),
+    lastIngestedAt:
+      typeof state?.lastIngestedAt === "string" ? state.lastIngestedAt : null,
+    __hydrated: options.__hydrated ?? true,
+    __durableVersion: Math.max(0, Number(durableVersion) || 0),
+    __persistenceDeferred: options.__persistenceDeferred ?? false,
+    __lastPersistenceError: options.__lastPersistenceError ?? null,
+  };
+}
+
+function stripTelemetrySessionRuntimeState(
+  state: Partial<TelemetrySessionRuntimeState> | null | undefined,
+): TelemetrySessionState {
+  const runtime = createTelemetrySessionRuntimeState(state ?? null, state?.__durableVersion ?? 0);
+
+  return {
+    lastTelemetry: runtime.lastTelemetry,
+    validationCount: runtime.validationCount,
+    outlierCount: runtime.outlierCount,
+    lastAnomaly: runtime.lastAnomaly,
+    lastPrediction: runtime.lastPrediction,
+    lastIngestedAt: runtime.lastIngestedAt,
+  };
+}
 
 function describeInquiryError(error: unknown): InquiryErrorDetails {
   const values: string[] = [];
@@ -116,6 +294,209 @@ function isManagedPredictionRecoveryError(error: unknown): boolean {
   );
 }
 
+function isManagedTelemetrySessionPersistenceRecoveryError(error: unknown): boolean {
+  const details = describeInquiryError(error);
+  const values = details.values.join(" | ");
+
+  return (
+    values.includes("No routeable internal transport available") ||
+    values.includes("Waiting for authority route updates before retrying") ||
+    values.includes("ECONNREFUSED") ||
+    values.includes("ENOTFOUND") ||
+    values.includes("timed out") ||
+    values.includes("failed, reason:")
+  );
+}
+
+function scheduleTelemetrySessionFlush(
+  pending: PendingTelemetrySessionFlush,
+  delayMs: number,
+): void {
+  if (pending.timer) {
+    clearTimeout(pending.timer);
+  }
+
+  pending.timer = setTimeout(() => {
+    pending.timer = null;
+    void flushTelemetrySession(pending.deviceId);
+  }, delayMs);
+  pending.timer.unref?.();
+}
+
+async function flushTelemetrySession(deviceId: string): Promise<void> {
+  const pending = pendingTelemetrySessionFlushes.get(deviceId);
+  if (!pending || pending.inFlight) {
+    return;
+  }
+
+  const inquire = latestTelemetrySessionInquire;
+  if (!inquire) {
+    scheduleTelemetrySessionFlush(pending, pending.retryDelayMs);
+    return;
+  }
+
+  const snapshotVersion = pending.durableVersion;
+  const snapshotState = pending.durableState;
+  pending.inFlight = true;
+
+  try {
+    const result = await inquire(
+      META_ACTOR_SESSION_STATE_PERSIST_INTENT,
+      {
+        actor_name: TELEMETRY_SESSION_ACTOR_NAME,
+        actor_key: deviceId,
+        actor_version: TELEMETRY_SESSION_ACTOR_VERSION,
+        durable_state: snapshotState,
+        durable_version: snapshotVersion,
+      },
+      {
+        requireComplete: true,
+        rejectOnTimeout: true,
+        timeout: TELEMETRY_SESSION_PERSIST_TIMEOUT_MS,
+      },
+    );
+
+    if (
+      result &&
+      typeof result === "object" &&
+      (result.errored === true || result.failed === true || result.__success === false)
+    ) {
+      throw result;
+    }
+
+    const current = pendingTelemetrySessionFlushes.get(deviceId);
+    if (!current) {
+      return;
+    }
+
+    current.inFlight = false;
+    current.retryDelayMs = TELEMETRY_SESSION_RETRY_BASE_MS;
+
+    if (current.durableVersion <= snapshotVersion) {
+      pendingTelemetrySessionFlushes.delete(deviceId);
+      return;
+    }
+
+    scheduleTelemetrySessionFlush(current, 0);
+  } catch (error) {
+    const current = pendingTelemetrySessionFlushes.get(deviceId);
+    if (!current) {
+      return;
+    }
+
+    current.inFlight = false;
+    current.retryDelayMs = Math.min(
+      Math.max(current.retryDelayMs, TELEMETRY_SESSION_RETRY_BASE_MS) * 2,
+      TELEMETRY_SESSION_RETRY_MAX_MS,
+    );
+
+    if (!isManagedTelemetrySessionPersistenceRecoveryError(error)) {
+      current.retryDelayMs = TELEMETRY_SESSION_RETRY_MAX_MS;
+    }
+
+    scheduleTelemetrySessionFlush(current, current.retryDelayMs);
+  }
+}
+
+function queueTelemetrySessionFlush(
+  deviceId: string,
+  state: TelemetrySessionRuntimeState,
+  inquire: CadenzaInquiry,
+): TelemetrySessionRuntimeState {
+  latestTelemetrySessionInquire = inquire;
+
+  const durableState = stripTelemetrySessionRuntimeState(state);
+  const durableVersion = state.__durableVersion;
+  const existing = pendingTelemetrySessionFlushes.get(deviceId);
+
+  if (existing) {
+    existing.durableState = durableState;
+    existing.durableVersion = durableVersion;
+
+    if (!existing.inFlight) {
+      existing.retryDelayMs = TELEMETRY_SESSION_RETRY_BASE_MS;
+      scheduleTelemetrySessionFlush(existing, 0);
+    }
+  } else {
+    const pending: PendingTelemetrySessionFlush = {
+      deviceId,
+      durableState,
+      durableVersion,
+      retryDelayMs: TELEMETRY_SESSION_RETRY_BASE_MS,
+      inFlight: false,
+      timer: null,
+    };
+    pendingTelemetrySessionFlushes.set(deviceId, pending);
+    scheduleTelemetrySessionFlush(pending, 0);
+  }
+
+  return {
+    ...state,
+    __persistenceDeferred: true,
+    __lastPersistenceError: null,
+  };
+}
+
+async function loadDurableTelemetrySessionState(
+  deviceId: string,
+  inquire: CadenzaInquiry,
+): Promise<TelemetrySessionRuntimeState> {
+  if (hydratedTelemetrySessionKeys.has(deviceId)) {
+    return createTelemetrySessionRuntimeState(undefined, 0, { __hydrated: false });
+  }
+
+  const existing = pendingTelemetrySessionHydrations.get(deviceId);
+  if (existing) {
+    return existing;
+  }
+
+  const hydration = (async () => {
+    try {
+      const result = await inquire(
+        META_ACTOR_SESSION_STATE_HYDRATE_INTENT,
+        {
+          actor_name: TELEMETRY_SESSION_ACTOR_NAME,
+          actor_key: deviceId,
+          actor_version: TELEMETRY_SESSION_ACTOR_VERSION,
+        },
+        {
+          requireComplete: true,
+          rejectOnTimeout: true,
+          timeout: TELEMETRY_SESSION_PERSIST_TIMEOUT_MS,
+        },
+      );
+
+      if (
+        result &&
+        typeof result === "object" &&
+        result.__success === true &&
+        result.hydrated === true
+      ) {
+        return createTelemetrySessionRuntimeState(
+          result.durable_state as Partial<TelemetrySessionState>,
+          Number(result.durable_version ?? 0),
+        );
+      }
+    } catch (error) {
+      return createTelemetrySessionRuntimeState(
+        undefined,
+        0,
+        {
+          __persistenceDeferred: true,
+          __lastPersistenceError: describeInquiryError(error).values[0] ?? null,
+        },
+      );
+    } finally {
+      pendingTelemetrySessionHydrations.delete(deviceId);
+    }
+
+    return createTelemetrySessionRuntimeState(undefined, 0);
+  })();
+
+  pendingTelemetrySessionHydrations.set(deviceId, hydration);
+  return hydration;
+}
+
 const normalizeIngestPayloadTask = Cadenza.createTask(
   "Normalize telemetry ingest payload",
   (ctx: any) => {
@@ -169,39 +550,119 @@ const normalizeIngestPayloadTask = Cadenza.createTask(
   "Validates canonical telemetry ingest payload and normalizes to internal context.",
 );
 
+const prepareTelemetrySessionContextTask = Cadenza.createTask(
+  "Prepare telemetry session context",
+  async (ctx: any, _emit: any, inquire: CadenzaInquiry) => {
+    const deviceId =
+      typeof ctx.deviceId === "string" ? ctx.deviceId.trim() : "";
+
+    if (!deviceId) {
+      throw new Error("deviceId is required for telemetry session state");
+    }
+
+    if (hydratedTelemetrySessionKeys.has(deviceId)) {
+      return {
+        ...ctx,
+        deviceId,
+      };
+    }
+
+    return {
+      ...ctx,
+      deviceId,
+      hydratedTelemetrySessionState: await loadDurableTelemetrySessionState(deviceId, inquire),
+    };
+  },
+  "Hydrates durable telemetry session state once per device without blocking on later outages.",
+);
+
+const prepareTelemetrySessionReadContextTask = Cadenza.createTask(
+  "Prepare telemetry session read context",
+  async (ctx: any, _emit: any, inquire: CadenzaInquiry) => {
+    const deviceId =
+      typeof ctx.deviceId === "string" ? ctx.deviceId.trim() : "";
+
+    if (!deviceId) {
+      throw new Error("deviceId is required for telemetry session state");
+    }
+
+    if (hydratedTelemetrySessionKeys.has(deviceId)) {
+      return {
+        ...ctx,
+        deviceId,
+      };
+    }
+
+    return {
+      ...ctx,
+      deviceId,
+      hydratedTelemetrySessionState: await loadDurableTelemetrySessionState(deviceId, inquire),
+    };
+  },
+  "Hydrates durable telemetry session state for read requests without blocking on later outages.",
+);
+
 const recordTelemetryIngestTask = Cadenza.createTask(
   "Record telemetry ingest session state",
   telemetrySessionActor.task(
-    ({ input, state, setState }) => {
-      const nextValidationCount = state.validationCount + 1;
-      const nextOutlierCount = state.outlierCount + (input.isOutlier ? 1 : 0);
+    ({ actor, input, state, setState }) => {
+      const baseState = state.__hydrated
+        ? state
+        : createTelemetrySessionRuntimeState(
+            input.hydratedTelemetrySessionState,
+            input.hydratedTelemetrySessionState?.__durableVersion ?? 0,
+          );
+      const nextValidationCount = baseState.validationCount + 1;
+      const nextOutlierCount = baseState.outlierCount + (input.isOutlier ? 1 : 0);
+      const nextState = createTelemetrySessionRuntimeState(
+        {
+          ...baseState,
+          lastTelemetry: sanitizeTelemetryPayload(input.telemetryPayload),
+          validationCount: nextValidationCount,
+          outlierCount: nextOutlierCount,
+          lastIngestedAt: input.timestamp,
+        },
+        baseState.__durableVersion + 1,
+      );
 
-      setState({
-        ...state,
-        lastTelemetry: input.telemetryPayload,
-        validationCount: nextValidationCount,
-        outlierCount: nextOutlierCount,
-        lastIngestedAt: input.timestamp,
-      });
+      hydratedTelemetrySessionKeys.add(actor.key);
+      setState(nextState);
 
       return {
         ...input,
+        telemetrySessionState: nextState,
         validationCount: nextValidationCount,
         outlierCount: nextOutlierCount,
       };
     },
     { mode: "write" },
   ),
-  "Updates durable telemetry session actor with current ingest payload counters.",
+  "Updates local telemetry session actor state with current ingest payload counters.",
 );
 
-const requestTelemetryIngestSessionPersistenceTask = Cadenza.createTask(
-  "Request telemetry ingest session persistence",
-  (ctx: any, emit: any) => {
-    emit(TELEMETRY_SESSION_INGEST_PERSIST_SIGNAL, ctx);
-    return ctx;
+const persistTelemetryIngestSessionBestEffortTask = Cadenza.createTask(
+  "Persist telemetry ingest session state best effort",
+  async (ctx: any, _emit: any, inquire: CadenzaInquiry) => {
+    if (!ctx.telemetrySessionState || !ctx.deviceId) {
+      return ctx;
+    }
+
+    const nextState = queueTelemetrySessionFlush(
+      ctx.deviceId,
+      ctx.telemetrySessionState as TelemetrySessionRuntimeState,
+      inquire,
+    );
+
+    return {
+      ...ctx,
+      telemetrySessionState: nextState,
+      sessionPersistenceDeferred: nextState.__persistenceDeferred,
+      sessionPersistenceReason: nextState.__persistenceDeferred
+        ? "telemetry_session_persist_deferred"
+        : null,
+    };
   },
-  "Detaches telemetry ingest session persistence from the inquiry-critical path.",
+  "Queues latest telemetry session snapshot for durable persistence without blocking ingest.",
 );
 
 const prepareTelemetryInsertTask = Cadenza.createTask(
@@ -432,35 +893,61 @@ const computePredictionTask = Cadenza.createTask(
 const recordTelemetryAnalysisTask = Cadenza.createTask(
   "Record telemetry analysis session state",
   telemetrySessionActor.task(
-    ({ input, state, setState }) => {
-      setState({
-        ...state,
-        lastAnomaly: input.anomalyResult ?? state.lastAnomaly,
-        lastPrediction: input.predictionResult ?? state.lastPrediction,
-      });
+    ({ actor, input, state, setState }) => {
+      const baseState = state.__hydrated
+        ? state
+        : createTelemetrySessionRuntimeState(
+            input.hydratedTelemetrySessionState,
+            input.hydratedTelemetrySessionState?.__durableVersion ?? 0,
+          );
+      const nextState = createTelemetrySessionRuntimeState(
+        {
+          ...baseState,
+          lastAnomaly: sanitizeAnomalyResult(input.anomalyResult) ?? baseState.lastAnomaly,
+          lastPrediction:
+            sanitizePredictionResult(input.predictionResult) ?? baseState.lastPrediction,
+        },
+        baseState.__durableVersion + 1,
+      );
+
+      hydratedTelemetrySessionKeys.add(actor.key);
+      setState(nextState);
 
       return {
         ...input,
-        lastAnomaly: input.anomalyResult ?? state.lastAnomaly,
-        lastPrediction: input.predictionResult ?? state.lastPrediction,
+        telemetrySessionState: nextState,
+        lastAnomaly: nextState.lastAnomaly,
+        lastPrediction: nextState.lastPrediction,
       };
     },
     { mode: "write" },
   ),
-  "Persists latest anomaly/prediction outcomes for telemetry session actor.",
+  "Updates local telemetry session actor with latest anomaly/prediction outcomes.",
 );
 
-const requestTelemetryAnalysisSessionPersistenceTask = Cadenza.createTask(
-  "Request telemetry analysis session persistence",
-  (ctx: any, emit: any) => {
-    if (ctx.iotDbPersistenceDeferred) {
+const persistTelemetryAnalysisSessionBestEffortTask = Cadenza.createTask(
+  "Persist telemetry analysis session state best effort",
+  async (ctx: any, _emit: any, inquire: CadenzaInquiry) => {
+    if (!ctx.telemetrySessionState || !ctx.deviceId) {
       return ctx;
     }
 
-    emit(TELEMETRY_SESSION_ANALYSIS_PERSIST_SIGNAL, ctx);
-    return ctx;
+    const nextState = queueTelemetrySessionFlush(
+      ctx.deviceId,
+      ctx.telemetrySessionState as TelemetrySessionRuntimeState,
+      inquire,
+    );
+
+    return {
+      ...ctx,
+      telemetrySessionState: nextState,
+      sessionPersistenceDeferred: nextState.__persistenceDeferred,
+      sessionPersistenceReason: nextState.__persistenceDeferred
+        ? "telemetry_session_persist_deferred"
+        : null,
+    };
   },
-  "Detaches telemetry analysis session persistence from the inquiry-critical path.",
+  "Queues latest telemetry analysis snapshot for durable persistence without blocking ingest.",
 );
 
 const finalizeTelemetryIngestTask = Cadenza.createTask(
@@ -491,31 +978,48 @@ const finalizeTelemetryIngestTask = Cadenza.createTask(
   "Builds canonical iot-telemetry-ingest response payload.",
 );
 
-normalizeIngestPayloadTask.then(requestTelemetryIngestSessionPersistenceTask);
-requestTelemetryIngestSessionPersistenceTask.then(prepareTelemetryInsertTask);
+normalizeIngestPayloadTask.then(prepareTelemetrySessionContextTask);
+prepareTelemetrySessionContextTask.then(recordTelemetryIngestTask);
+recordTelemetryIngestTask.then(persistTelemetryIngestSessionBestEffortTask);
+persistTelemetryIngestSessionBestEffortTask.then(prepareTelemetryInsertTask);
 prepareTelemetryInsertTask.then(persistTelemetryTask);
 persistTelemetryTask.then(emitTelemetryIngestedSignalTask);
 emitTelemetryIngestedSignalTask.then(detectAnomalyTask);
 detectAnomalyTask.then(computePredictionTask);
-computePredictionTask.then(requestTelemetryAnalysisSessionPersistenceTask);
-requestTelemetryAnalysisSessionPersistenceTask.then(finalizeTelemetryIngestTask);
+computePredictionTask.then(recordTelemetryAnalysisTask);
+recordTelemetryAnalysisTask.then(persistTelemetryAnalysisSessionBestEffortTask);
+persistTelemetryAnalysisSessionBestEffortTask.then(finalizeTelemetryIngestTask);
 normalizeIngestPayloadTask.respondsTo(IOT_INTENTS.telemetryIngest);
 
-recordTelemetryIngestTask.doOn(TELEMETRY_SESSION_INGEST_PERSIST_SIGNAL);
-recordTelemetryAnalysisTask.doOn(TELEMETRY_SESSION_ANALYSIS_PERSIST_SIGNAL);
-
-Cadenza.createTask(
+const getTelemetrySessionStateTask = Cadenza.createTask(
   "Get telemetry session state",
   telemetrySessionActor.task(
-    ({ actor, state }) => ({
-      __success: true,
-      actorKey: actor.key,
-      session: state,
-    }),
-    { mode: "read" },
+    ({ actor, input, state, setState }) => {
+      const nextState = state.__hydrated
+        ? state
+        : createTelemetrySessionRuntimeState(
+            input.hydratedTelemetrySessionState,
+            input.hydratedTelemetrySessionState?.__durableVersion ?? 0,
+          );
+
+      if (!state.__hydrated) {
+        hydratedTelemetrySessionKeys.add(actor.key);
+        setState(nextState);
+      }
+
+      return {
+        __success: true,
+        actorKey: actor.key,
+        session: stripTelemetrySessionRuntimeState(nextState),
+      };
+    },
+    { mode: "write" },
   ),
   "Returns persisted telemetry actor session state by device key.",
-).respondsTo(IOT_INTENTS.telemetrySessionGet);
+);
+
+prepareTelemetrySessionReadContextTask.then(getTelemetrySessionStateTask);
+prepareTelemetrySessionReadContextTask.respondsTo(IOT_INTENTS.telemetrySessionGet);
 
 Cadenza.createCadenzaService(
   "TelemetryCollectorService",

@@ -1,4 +1,4 @@
-import { defineNuxtPlugin, useState } from "nuxt/app";
+import { defineNuxtPlugin, onNuxtReady, useState } from "nuxt/app";
 import {
   type BrowserCadenzaRuntime,
   type BrowserCadenzaRuntimeState,
@@ -32,6 +32,19 @@ export default defineNuxtPlugin(() => {
       listener(runtimeState.value);
     }
   };
+  const markReady = () => {
+    if (readyState.value) {
+      return;
+    }
+
+    readyState.value = true;
+    runtimeState.value = {
+      ...runtimeState.value,
+      ready: true,
+      lastReadyAt: new Date().toISOString(),
+    };
+    notify();
+  };
 
   const inquire: BrowserCadenzaRuntime["inquire"] = async (
     inquiry,
@@ -48,16 +61,7 @@ export default defineNuxtPlugin(() => {
     });
 
   const waitUntilReady = async () => {
-    if (readyState.value) {
-      return;
-    }
-    readyState.value = true;
-    runtimeState.value = {
-      ...runtimeState.value,
-      ready: true,
-      lastReadyAt: new Date().toISOString(),
-    };
-    notify();
+    markReady();
   };
 
   const runtime: BrowserCadenzaRuntime = {
@@ -77,14 +81,9 @@ export default defineNuxtPlugin(() => {
   };
 
   runtime.commands = createDemoFrontendCommands({ inquire }, runtime);
-
-  readyState.value = true;
-  runtimeState.value = {
-    ...runtimeState.value,
-    ready: true,
-    lastReadyAt: new Date().toISOString(),
-  };
-  notify();
+  onNuxtReady(() => {
+    markReady();
+  });
 
   return {
     provide: {
