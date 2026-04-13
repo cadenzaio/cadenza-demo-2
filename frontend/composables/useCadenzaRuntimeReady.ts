@@ -1,6 +1,7 @@
-import { computed } from "vue";
+import {
+  useCadenzaRuntimeReady as useNuxtCadenzaRuntimeReady,
+} from "@cadenza.io/service/nuxt";
 
 export function useCadenzaRuntimeReady() {
-  const readyState = useState<boolean>("demo-cadenza-runtime-ready", () => false);
-  return computed(() => readyState.value);
+  return useNuxtCadenzaRuntimeReady();
 }

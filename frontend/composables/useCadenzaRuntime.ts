@@ -1,5 +1,8 @@
-import type { BrowserCadenzaRuntime } from "../lib/cadenza/runtime";
+import {
+  useCadenzaRuntime as useNuxtCadenzaRuntime,
+} from "@cadenza.io/service/nuxt";
+import type { DemoFrontendRuntime } from "../lib/cadenza/runtime";
 
 export function useCadenzaRuntime() {
-  return useNuxtApp().$cadenzaRuntime as BrowserCadenzaRuntime;
+  return useNuxtCadenzaRuntime<DemoFrontendRuntime>();
 }

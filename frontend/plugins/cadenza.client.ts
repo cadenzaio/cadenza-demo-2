@@ -1,93 +1,29 @@
-import { defineNuxtPlugin, onNuxtReady, useState } from "nuxt/app";
+import { defineNuxtPlugin } from "nuxt/app";
+import Cadenza from "@cadenza.io/service";
+import { defineCadenzaNuxtRuntimePlugin } from "@cadenza.io/service/nuxt";
 import {
-  type BrowserCadenzaRuntime,
-  type BrowserCadenzaRuntimeState,
   createDemoFrontendCommands,
+  createDemoFrontendSignalBindings,
 } from "../lib/cadenza/runtime";
 
-const RUNTIME_READY_KEY = "demo-cadenza-runtime-ready";
-const RUNTIME_STATE_KEY = "demo-cadenza-runtime-state";
-
-function createDefaultRuntimeState(): BrowserCadenzaRuntimeState {
-  return {
-    ready: false,
-    projectionState: {
-      liveFeed: [],
+const setup = defineCadenzaNuxtRuntimePlugin({
+  cadenza: Cadenza,
+  actorName: "BrowserDemoFrontendRuntimeActor",
+  hydrationStateKey: "demo-cadenza-hydration",
+  service: {
+    name: "DemoFrontend",
+    description: "Nuxt demo frontend browser runtime.",
+    useSocket: true,
+    cadenzaDB: {
+      connect: false,
     },
-    lastReadyAt: null,
-    lastSyncRequestedAt: null,
-  };
-}
-
-export default defineNuxtPlugin(() => {
-  const readyState = useState<boolean>(RUNTIME_READY_KEY, () => false);
-  const runtimeState = useState<BrowserCadenzaRuntimeState>(
-    RUNTIME_STATE_KEY,
-    createDefaultRuntimeState,
-  );
-
-  const listeners = new Set<(state: BrowserCadenzaRuntimeState) => void>();
-  const notify = () => {
-    for (const listener of listeners) {
-      listener(runtimeState.value);
-    }
-  };
-  const markReady = () => {
-    if (readyState.value) {
-      return;
-    }
-
-    readyState.value = true;
-    runtimeState.value = {
-      ...runtimeState.value,
-      ready: true,
-      lastReadyAt: new Date().toISOString(),
-    };
-    notify();
-  };
-
-  const inquire: BrowserCadenzaRuntime["inquire"] = async (
-    inquiry,
-    context = {},
-    options = {},
-  ) =>
-    $fetch("/api/cadenza/inquire", {
-      method: "POST",
-      body: {
-        inquiry,
-        context,
-        options,
-      },
-    });
-
-  const waitUntilReady = async () => {
-    markReady();
-  };
-
-  const runtime: BrowserCadenzaRuntime = {
-    actor: null,
-    actorHandle: null,
-    waitUntilReady,
-    inquire,
-    getRuntimeState: () => runtimeState.value,
-    subscribe: (listener) => {
-      listeners.add(listener);
-      listener(runtimeState.value);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    commands: {} as BrowserCadenzaRuntime["commands"],
-  };
-
-  runtime.commands = createDemoFrontendCommands({ inquire }, runtime);
-  onNuxtReady(() => {
-    markReady();
-  });
-
-  return {
-    provide: {
-      cadenzaRuntime: runtime,
-    },
-  };
+  },
+  bootstrapUrl: (config) => String(config.public.cadenzaBootstrapUrl),
+  initialProjectionState: {
+    liveFeed: [],
+  },
+  signalBindings: createDemoFrontendSignalBindings(),
+  commands: ({ runtime }) => createDemoFrontendCommands(runtime),
 });
+
+export default defineNuxtPlugin(setup);

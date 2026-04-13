@@ -23,7 +23,7 @@ Additional reading:
 - `frontend` (`DemoFrontend`)
   - Nuxt 3 SSR app at `http://frontend.localhost`
   - uses `createSSRInquiryBridge(...)` for first render
-  - starts a Nuxt wrapper runtime after hydration via `defineCadenzaNuxtRuntimePlugin(...)` from `@cadenza.io/service/nuxt`
+  - uses the official Nuxt browser runtime primitive after hydration via `defineCadenzaNuxtRuntimePlugin(...)` from `@cadenza.io/service/nuxt`
   - reduces `global.iot.*` signals into projection state slices such as `liveFeed`
   - emits `iot-telemetry-ingest` directly from the browser for manual controls
 - `cadenza-ui`

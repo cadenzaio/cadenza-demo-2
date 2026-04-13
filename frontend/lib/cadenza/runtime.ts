@@ -1,14 +1,10 @@
+import type {
+  CadenzaNuxtRuntime,
+  CadenzaNuxtRuntimeState,
+} from "@cadenza.io/service/nuxt";
 import type { LiveEvent, SignalName } from "./contracts";
 import { IOT_INTENTS, IOT_SIGNALS } from "./contracts";
 import { appendLiveEvent, signalPayloadToLiveEvent } from "./live-events";
-
-type MinimalCadenza = {
-  inquire: (
-    inquiry: string,
-    context: Record<string, any>,
-    options?: Record<string, any>,
-  ) => Promise<any>;
-};
 
 export type DemoFrontendProjectionState = {
   liveFeed: LiveEvent[];
@@ -26,28 +22,13 @@ export type DemoFrontendCommands = {
   }) => Promise<any>;
 };
 
-export type BrowserCadenzaRuntimeState = {
-  ready: boolean;
-  projectionState: DemoFrontendProjectionState;
-  lastReadyAt: string | null;
-  lastSyncRequestedAt: string | null;
-};
+export type DemoFrontendRuntimeState =
+  CadenzaNuxtRuntimeState<DemoFrontendProjectionState>;
 
-export type BrowserCadenzaRuntime = {
-  actor: null;
-  actorHandle: null;
-  waitUntilReady: () => Promise<void>;
-  inquire: (
-    inquiry: string,
-    context?: Record<string, any>,
-    options?: Record<string, any>,
-  ) => Promise<any>;
-  getRuntimeState: () => BrowserCadenzaRuntimeState;
-  subscribe: (
-    listener: (state: BrowserCadenzaRuntimeState) => void,
-  ) => () => void;
-  commands: DemoFrontendCommands;
-};
+export type DemoFrontendRuntime = CadenzaNuxtRuntime<
+  DemoFrontendProjectionState,
+  DemoFrontendCommands
+>;
 
 export function createLiveFeedProjection(signalName: SignalName) {
   return {
@@ -80,15 +61,15 @@ export function createDemoFrontendSignalBindings() {
 }
 
 export function createDemoFrontendCommands(
-  cadenza: MinimalCadenza,
-  runtime: {
-    waitUntilReady: () => Promise<void>;
-  },
+  runtime: Pick<
+    DemoFrontendRuntime,
+    "waitUntilReady" | "inquire"
+  >,
 ): DemoFrontendCommands {
   return {
     ingestTelemetry: async (payload) => {
       await runtime.waitUntilReady();
-      return cadenza.inquire(
+      return runtime.inquire(
         IOT_INTENTS.telemetryIngest,
         {
           deviceId: payload.deviceId,
