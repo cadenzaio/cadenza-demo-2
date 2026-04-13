@@ -7,6 +7,7 @@ const routes = {
   "cadenza-db.localhost": "http://cadenza-db-service:8080",
   "iot-db.localhost": "http://iot-db-service:3001",
   "telemetry-collector.localhost": "http://telemetry-collector:3003",
+  "telemetry-collector-b.localhost": "http://telemetry-collector-b:3003",
   "anomaly-detector.localhost": "http://anomaly-detector:3004",
   "predictor.localhost": "http://predictor:3005",
   "alert-service.localhost": "http://alert-service:3006",

@@ -41,6 +41,10 @@ Additional reading:
   - calls anomaly + prediction intents
   - emits `global.iot.telemetry.ingested` and `global.iot.anomaly.detected` when needed
   - owns persisted `TelemetrySessionActor`
+- `telemetry-collector-b` (`TelemetryCollectorService`)
+  - second official instance of the same service
+  - proves duplicate-instance routing and authority registration on a hot ingest path
+  - exposes a separate public origin at `http://telemetry-collector-b.localhost`
 - `anomaly-detector` (`AnomalyDetectorService`)
   - responds to `iot-anomaly-detect`
   - computes anomaly from rolling runtime history
@@ -104,6 +108,7 @@ Open:
 - `http://console.localhost`
 - `http://cadenza-db.localhost`
 - `http://telemetry-collector.localhost`
+- `http://telemetry-collector-b.localhost`
 - `http://anomaly-detector.localhost`
 - `http://predictor.localhost`
 - `http://alert-service.localhost`
@@ -137,6 +142,7 @@ docker-compose logs -f
 
 - Postgres is reachable on `localhost:5433` (`iot_user` / `iot_pass`); the demo services create and use `cadenza_db` and `iot_db_service`
 - the browser connects directly to service public transports through the `edge` proxy on `*.localhost`
+- the demo intentionally runs two `TelemetryCollectorService` instances to prove duplicate-instance routing on a real hot path
 - `cadenza-ui` is built from its own sibling repo and included in this demo stack as an additional browser-facing service
 - the runner stays internal-only; its status is surfaced to the frontend during SSR
 
@@ -182,6 +188,8 @@ docker-compose logs -f
 
 ## Notes
 
+- Each service package that uses a local `.env` file now includes a tracked `.env.example`.
+  Copy the matching example to `.env` before running the demo locally.
 - `WEATHER_API_KEY` is optional; predictor falls back to neutral weather context when absent.
 - the runner defaults to `TRAFFIC_MODE=low` and `DEVICE_COUNT=50`.
 - the frontend server uses internal Docker service names for SSR bootstrap and `http://cadenza-db.localhost:80` for the hydrated browser runtime.

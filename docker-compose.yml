@@ -98,6 +98,35 @@ services:
     networks:
       - iot-network
 
+  telemetry-collector-b:
+    build:
+      context: ./services/telemetry-collector
+      dockerfile: Dockerfile
+    env_file:
+      - ./services/telemetry-collector/.env
+    environment:
+      - CADENZA_SERVER_URL=telemetry-collector-b
+      - CADENZA_DB_ADDRESS=cadenza-db-service
+      - CADENZA_DB_PORT=8080
+      - PUBLIC_ORIGIN=http://telemetry-collector-b.localhost
+    depends_on:
+      cadenza-db-service:
+        condition: service_healthy
+      iot-db-service:
+        condition: service_started
+      anomaly-detector:
+        condition: service_started
+      predictor:
+        condition: service_started
+      alert-service:
+        condition: service_started
+    volumes:
+      - shared_telemetry:/shared
+      - ./scripts:/scripts:ro
+    working_dir: /app
+    networks:
+      - iot-network
+
   anomaly-detector:
     build:
       context: ./services/anomaly-detector
@@ -176,15 +205,14 @@ services:
       - CADENZA_DB_PORT=8080
       - TRAFFIC_MODE=low
       - DEVICE_COUNT=50
-      - CADENZA_INSTANCE_DEBUG=1
-      - CADENZA_SERVICE_REGISTRY_TRACE_SERVICE=ScheduledRunnerService
-      - CADENZA_SYNC_PHASE_TRACE_SERVICE=ScheduledRunnerService
     depends_on:
       cadenza-db-service:
         condition: service_healthy
       iot-db-service:
         condition: service_started
       telemetry-collector:
+        condition: service_started
+      telemetry-collector-b:
         condition: service_started
     volumes:
       - shared_telemetry:/shared
@@ -212,6 +240,8 @@ services:
       iot-db-service:
         condition: service_started
       telemetry-collector:
+        condition: service_started
+      telemetry-collector-b:
         condition: service_started
       anomaly-detector:
         condition: service_started

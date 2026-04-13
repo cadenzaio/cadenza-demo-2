@@ -236,6 +236,7 @@ Within this repo:
 - The repo now includes a Nuxt frontend that SSR-loads with the SSR inquiry bridge and then hydrates into a direct browser Cadenza runtime.
 - The repo can also include the sibling `cadenza-ui` React console as a separate browser-facing service behind the same edge proxy.
 - Browser-reachable demo services declare explicit public transports and are exposed locally through a Caddy proxy on `*.localhost`.
+- The demo intentionally runs two `TelemetryCollectorService` instances so duplicate-instance routing is exercised on a high-traffic service.
 - The runner remains internal-only and should not be treated as a browser-facing service.
 - Demo-specific stabilization and debugging lessons are recorded in [docs/demo-lessons.md](./docs/demo-lessons.md).
 
