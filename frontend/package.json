@@ -11,8 +11,8 @@
     "postinstall": "nuxt prepare"
   },
   "dependencies": {
-    "@cadenza.io/core": "^3.27.0",
-    "@cadenza.io/service": "^2.20.1",
+    "@cadenza.io/core": "^3.28.0",
+    "@cadenza.io/service": "^2.21.0",
     "nuxt": "^3.17.2"
   },
   "devDependencies": {

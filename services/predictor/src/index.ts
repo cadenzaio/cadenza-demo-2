@@ -14,6 +14,13 @@ const publicOrigin =
 const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "predictor"}:${
   process.env.HTTP_PORT ?? "3005"
 }`;
+const META_ACTOR_SESSION_STATE_HYDRATE_INTENT = "meta-actor-session-state-hydrate";
+const META_ACTOR_SESSION_STATE_PERSIST_INTENT = "meta-actor-session-state-persist";
+const PREDICTION_SESSION_PERSIST_TIMEOUT_MS = 10_000;
+const PREDICTION_SESSION_RETRY_BASE_MS = 1_000;
+const PREDICTION_SESSION_RETRY_MAX_MS = 30_000;
+const PREDICTION_SESSION_ACTOR_NAME = "PredictionSessionActor";
+const PREDICTION_SESSION_ACTOR_VERSION = 1;
 
 type PredictionSessionState = {
   lastProbability: number;
@@ -22,6 +29,22 @@ type PredictionSessionState = {
   lastAnomalyScore: number;
   computeCount: number;
   lastComputedAt: string | null;
+};
+
+type PredictionSessionRuntimeState = PredictionSessionState & {
+  __hydrated: boolean;
+  __durableVersion: number;
+  __persistenceDeferred: boolean;
+  __lastPersistenceError: string | null;
+};
+
+type PendingPredictionSessionFlush = {
+  deviceId: string;
+  durableState: PredictionSessionState;
+  durableVersion: number;
+  retryDelayMs: number;
+  inFlight: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
 };
 
 type WeatherData = {
@@ -37,7 +60,24 @@ type WeatherRuntimeState = {
   cacheMisses: number;
 };
 
-const predictionSessionActor = Cadenza.createActor<PredictionSessionState>({
+type CadenzaInquiry = (
+  inquiryName: string,
+  context: Record<string, unknown>,
+  options: any,
+) => Promise<any>;
+
+const hydratedPredictionSessionKeys = new Set<string>();
+const pendingPredictionSessionHydrations = new Map<
+  string,
+  Promise<PredictionSessionRuntimeState>
+>();
+const pendingPredictionSessionFlushes = new Map<
+  string,
+  PendingPredictionSessionFlush
+>();
+let latestPredictionSessionInquire: CadenzaInquiry | null = null;
+
+const predictionSessionActor = Cadenza.createActor<PredictionSessionRuntimeState>({
   name: "PredictionSessionActor",
   description:
     "Per-device durable prediction session state for latest risk and ETA outputs.",
@@ -51,10 +91,13 @@ const predictionSessionActor = Cadenza.createActor<PredictionSessionState>({
     lastAnomalyScore: 0,
     computeCount: 0,
     lastComputedAt: null,
+    __hydrated: false,
+    __durableVersion: 0,
+    __persistenceDeferred: false,
+    __lastPersistenceError: null,
   },
   session: {
-    persistDurableState: true,
-    persistenceTimeoutMs: 30000,
+    persistDurableState: false,
   },
 });
 
@@ -76,8 +119,304 @@ const weatherRuntimeActor = Cadenza.createActor<
   },
 });
 
-const PREDICTION_SESSION_PERSIST_SIGNAL =
-  "meta.demo.prediction.session_persist_requested";
+function buildDefaultPredictionSessionState(): PredictionSessionState {
+  return {
+    lastProbability: 0,
+    lastPredictedEta: null,
+    lastRiskFactors: null,
+    lastAnomalyScore: 0,
+    computeCount: 0,
+    lastComputedAt: null,
+  };
+}
+
+function createPredictionSessionRuntimeState(
+  state: Partial<PredictionSessionState> | null | undefined,
+  durableVersion = 0,
+  options: Partial<
+    Pick<
+      PredictionSessionRuntimeState,
+      "__hydrated" | "__persistenceDeferred" | "__lastPersistenceError"
+    >
+  > = {},
+): PredictionSessionRuntimeState {
+  const base = buildDefaultPredictionSessionState();
+
+  return {
+    ...base,
+    ...(state ?? {}),
+    lastProbability: Number(state?.lastProbability ?? base.lastProbability),
+    lastPredictedEta:
+      typeof state?.lastPredictedEta === "string" ? state.lastPredictedEta : null,
+    lastRiskFactors:
+      state?.lastRiskFactors && typeof state.lastRiskFactors === "object"
+        ? (state.lastRiskFactors as PredictionResult["riskFactors"])
+        : null,
+    lastAnomalyScore: Number(state?.lastAnomalyScore ?? base.lastAnomalyScore),
+    computeCount: Number(state?.computeCount ?? base.computeCount),
+    lastComputedAt:
+      typeof state?.lastComputedAt === "string" ? state.lastComputedAt : null,
+    __hydrated: options.__hydrated ?? true,
+    __durableVersion: Math.max(0, Number(durableVersion) || 0),
+    __persistenceDeferred: options.__persistenceDeferred ?? false,
+    __lastPersistenceError: options.__lastPersistenceError ?? null,
+  };
+}
+
+function stripPredictionSessionRuntimeState(
+  state: Partial<PredictionSessionRuntimeState> | null | undefined,
+): PredictionSessionState {
+  const runtime = createPredictionSessionRuntimeState(
+    state ?? null,
+    state?.__durableVersion ?? 0,
+  );
+
+  return {
+    lastProbability: runtime.lastProbability,
+    lastPredictedEta: runtime.lastPredictedEta,
+    lastRiskFactors: runtime.lastRiskFactors,
+    lastAnomalyScore: runtime.lastAnomalyScore,
+    computeCount: runtime.computeCount,
+    lastComputedAt: runtime.lastComputedAt,
+  };
+}
+
+function shouldTreatPredictionSessionAsHydrated(
+  state: Partial<PredictionSessionRuntimeState> | null | undefined,
+): boolean {
+  return state?.__hydrated === true;
+}
+
+function describeInquiryError(error: unknown): string[] {
+  const values: string[] = [];
+  const seen = new Set<unknown>();
+
+  const collect = (value: unknown, depth = 3) => {
+    if (depth < 0 || value === null || value === undefined) {
+      return;
+    }
+
+    if (typeof value === "string") {
+      values.push(value);
+      return;
+    }
+
+    if (typeof value === "number" || typeof value === "boolean") {
+      values.push(String(value));
+      return;
+    }
+
+    if (typeof value !== "object" || seen.has(value)) {
+      return;
+    }
+
+    seen.add(value);
+    for (const nested of Object.values(value as Record<string, unknown>)) {
+      collect(nested, depth - 1);
+    }
+  };
+
+  collect(error);
+  return values.length > 0 ? values : [String(error)];
+}
+
+function isManagedPredictionSessionPersistenceRecoveryError(error: unknown): boolean {
+  const values = describeInquiryError(error).join(" | ");
+
+  return (
+    values.includes("No routeable internal transport available") ||
+    values.includes("Waiting for authority route updates before retrying") ||
+    values.includes("ECONNREFUSED") ||
+    values.includes("ENOTFOUND") ||
+    values.includes("timed out") ||
+    values.includes("failed, reason:")
+  );
+}
+
+function schedulePredictionSessionFlush(
+  pending: PendingPredictionSessionFlush,
+  delayMs: number,
+): void {
+  if (pending.timer) {
+    clearTimeout(pending.timer);
+  }
+
+  pending.timer = setTimeout(() => {
+    pending.timer = null;
+    void flushPredictionSession(pending.deviceId);
+  }, delayMs);
+  pending.timer.unref?.();
+}
+
+async function flushPredictionSession(deviceId: string): Promise<void> {
+  const pending = pendingPredictionSessionFlushes.get(deviceId);
+  if (!pending || pending.inFlight) {
+    return;
+  }
+
+  const inquire = latestPredictionSessionInquire;
+  if (!inquire) {
+    schedulePredictionSessionFlush(pending, pending.retryDelayMs);
+    return;
+  }
+
+  const snapshotVersion = pending.durableVersion;
+  const snapshotState = pending.durableState;
+  pending.inFlight = true;
+
+  try {
+    const result = await inquire(
+      META_ACTOR_SESSION_STATE_PERSIST_INTENT,
+      {
+        actor_name: PREDICTION_SESSION_ACTOR_NAME,
+        actor_key: deviceId,
+        actor_version: PREDICTION_SESSION_ACTOR_VERSION,
+        durable_state: snapshotState,
+        durable_version: snapshotVersion,
+      },
+      {
+        requireComplete: true,
+        rejectOnTimeout: true,
+        timeout: PREDICTION_SESSION_PERSIST_TIMEOUT_MS,
+      },
+    );
+
+    if (
+      result &&
+      typeof result === "object" &&
+      (result.errored === true || result.failed === true || result.__success === false)
+    ) {
+      throw result;
+    }
+
+    const current = pendingPredictionSessionFlushes.get(deviceId);
+    if (!current) {
+      return;
+    }
+
+    current.inFlight = false;
+    current.retryDelayMs = PREDICTION_SESSION_RETRY_BASE_MS;
+
+    if (current.durableVersion <= snapshotVersion) {
+      pendingPredictionSessionFlushes.delete(deviceId);
+      return;
+    }
+
+    schedulePredictionSessionFlush(current, 0);
+  } catch (error) {
+    const current = pendingPredictionSessionFlushes.get(deviceId);
+    if (!current) {
+      return;
+    }
+
+    current.inFlight = false;
+    current.retryDelayMs = Math.min(
+      Math.max(current.retryDelayMs, PREDICTION_SESSION_RETRY_BASE_MS) * 2,
+      PREDICTION_SESSION_RETRY_MAX_MS,
+    );
+
+    if (!isManagedPredictionSessionPersistenceRecoveryError(error)) {
+      current.retryDelayMs = PREDICTION_SESSION_RETRY_MAX_MS;
+    }
+
+    schedulePredictionSessionFlush(current, current.retryDelayMs);
+  }
+}
+
+function queuePredictionSessionFlush(
+  deviceId: string,
+  state: PredictionSessionRuntimeState,
+  inquire: CadenzaInquiry,
+): PredictionSessionRuntimeState {
+  latestPredictionSessionInquire = inquire;
+
+  const durableState = stripPredictionSessionRuntimeState(state);
+  const durableVersion = state.__durableVersion;
+  const existing = pendingPredictionSessionFlushes.get(deviceId);
+
+  if (existing) {
+    existing.durableState = durableState;
+    existing.durableVersion = durableVersion;
+
+    if (!existing.inFlight) {
+      existing.retryDelayMs = PREDICTION_SESSION_RETRY_BASE_MS;
+      schedulePredictionSessionFlush(existing, 0);
+    }
+  } else {
+    const pending: PendingPredictionSessionFlush = {
+      deviceId,
+      durableState,
+      durableVersion,
+      retryDelayMs: PREDICTION_SESSION_RETRY_BASE_MS,
+      inFlight: false,
+      timer: null,
+    };
+    pendingPredictionSessionFlushes.set(deviceId, pending);
+    schedulePredictionSessionFlush(pending, 0);
+  }
+
+  return {
+    ...state,
+    __persistenceDeferred: true,
+    __lastPersistenceError: null,
+  };
+}
+
+async function loadDurablePredictionSessionState(
+  deviceId: string,
+  inquire: CadenzaInquiry,
+): Promise<PredictionSessionRuntimeState> {
+  if (hydratedPredictionSessionKeys.has(deviceId)) {
+    return createPredictionSessionRuntimeState(undefined, 0, { __hydrated: false });
+  }
+
+  const existing = pendingPredictionSessionHydrations.get(deviceId);
+  if (existing) {
+    return existing;
+  }
+
+  const hydration = (async () => {
+    try {
+      const result = await inquire(
+        META_ACTOR_SESSION_STATE_HYDRATE_INTENT,
+        {
+          actor_name: PREDICTION_SESSION_ACTOR_NAME,
+          actor_key: deviceId,
+          actor_version: PREDICTION_SESSION_ACTOR_VERSION,
+        },
+        {
+          requireComplete: true,
+          rejectOnTimeout: true,
+          timeout: PREDICTION_SESSION_PERSIST_TIMEOUT_MS,
+        },
+      );
+
+      if (
+        result &&
+        typeof result === "object" &&
+        result.__success === true &&
+        result.hydrated === true
+      ) {
+        return createPredictionSessionRuntimeState(
+          result.durable_state as Partial<PredictionSessionState>,
+          Number(result.durable_version ?? 0),
+        );
+      }
+    } catch (error) {
+      return createPredictionSessionRuntimeState(undefined, 0, {
+        __persistenceDeferred: true,
+        __lastPersistenceError: describeInquiryError(error)[0] ?? null,
+      });
+    } finally {
+      pendingPredictionSessionHydrations.delete(deviceId);
+    }
+
+    return createPredictionSessionRuntimeState(undefined, 0);
+  })();
+
+  pendingPredictionSessionHydrations.set(deviceId, hydration);
+  return hydration;
+}
 
 function clamp(value: number, min = 0, max = 1): number {
   if (value < min) return min;
@@ -128,6 +467,62 @@ const normalizePredictionInputTask = Cadenza.createTask(
     };
   },
   "Normalizes canonical prediction input and safeguards optional anomaly context.",
+);
+
+const preparePredictionSessionContextTask = Cadenza.createTask(
+  "Prepare prediction session context",
+  async (ctx: any, _emit: any, inquire: CadenzaInquiry) => {
+    const deviceId = typeof ctx.deviceId === "string" ? ctx.deviceId.trim() : "";
+
+    if (!deviceId) {
+      throw new Error("deviceId is required for prediction session state");
+    }
+
+    if (hydratedPredictionSessionKeys.has(deviceId)) {
+      return {
+        ...ctx,
+        deviceId,
+      };
+    }
+
+    return {
+      ...ctx,
+      deviceId,
+      hydratedPredictionSessionState: await loadDurablePredictionSessionState(
+        deviceId,
+        inquire,
+      ),
+    };
+  },
+  "Hydrates durable prediction session state once per device without blocking later outages.",
+);
+
+const preparePredictionSessionReadContextTask = Cadenza.createTask(
+  "Prepare prediction session read context",
+  async (ctx: any, _emit: any, inquire: CadenzaInquiry) => {
+    const deviceId = typeof ctx.deviceId === "string" ? ctx.deviceId.trim() : "";
+
+    if (!deviceId) {
+      throw new Error("deviceId is required for prediction session state");
+    }
+
+    if (hydratedPredictionSessionKeys.has(deviceId)) {
+      return {
+        ...ctx,
+        deviceId,
+      };
+    }
+
+    return {
+      ...ctx,
+      deviceId,
+      hydratedPredictionSessionState: await loadDurablePredictionSessionState(
+        deviceId,
+        inquire,
+      ),
+    };
+  },
+  "Hydrates durable prediction session state for read requests without blocking later outages.",
 );
 
 const fetchWeatherTask = Cadenza.createTask(
@@ -282,7 +677,13 @@ const computePredictionTask = Cadenza.createTask(
 const persistPredictionSessionTask = Cadenza.createTask(
   "Persist prediction session actor state",
   predictionSessionActor.task(
-    ({ input, state, setState }) => {
+    ({ actor, input, state, setState }) => {
+      const baseState = state.__hydrated
+        ? state
+        : createPredictionSessionRuntimeState(
+            input.hydratedPredictionSessionState,
+            input.hydratedPredictionSessionState?.__durableVersion ?? 0,
+          );
       const prediction =
         input.predictionResult ??
         (input.deviceId
@@ -308,16 +709,20 @@ const persistPredictionSessionTask = Cadenza.createTask(
         throw new Error("prediction result is required for session persistence");
       }
 
-      const nextState: PredictionSessionState = {
-        ...state,
-        lastProbability: prediction.failureProbability,
-        lastPredictedEta: prediction.predictedEta,
-        lastRiskFactors: prediction.riskFactors,
-        lastAnomalyScore: prediction.riskFactors.anomalyScore,
-        computeCount: state.computeCount + 1,
-        lastComputedAt: prediction.timestamp,
-      };
+      const nextState = createPredictionSessionRuntimeState(
+        {
+          ...baseState,
+          lastProbability: prediction.failureProbability,
+          lastPredictedEta: prediction.predictedEta,
+          lastRiskFactors: prediction.riskFactors,
+          lastAnomalyScore: prediction.riskFactors.anomalyScore,
+          computeCount: baseState.computeCount + 1,
+          lastComputedAt: prediction.timestamp,
+        },
+        baseState.__durableVersion + 1,
+      );
 
+      hydratedPredictionSessionKeys.add(actor.key);
       setState(nextState);
 
       return {
@@ -334,16 +739,32 @@ const persistPredictionSessionTask = Cadenza.createTask(
     },
     { mode: "write" },
   ),
-  "Writes latest prediction output to durable prediction session actor state.",
+  "Updates local prediction session actor state with the latest computed output.",
 );
 
-const requestPredictionSessionPersistenceTask = Cadenza.createTask(
-  "Request prediction session persistence",
-  (ctx: any, emit: any) => {
-    emit(PREDICTION_SESSION_PERSIST_SIGNAL, ctx);
-    return ctx;
+const persistPredictionSessionBestEffortTask = Cadenza.createTask(
+  "Persist prediction session state best effort",
+  async (ctx: any, _emit: any, inquire: CadenzaInquiry) => {
+    if (!ctx.predictionSession || !ctx.deviceId) {
+      return ctx;
+    }
+
+    const nextState = queuePredictionSessionFlush(
+      ctx.deviceId,
+      ctx.predictionSession as PredictionSessionRuntimeState,
+      inquire,
+    );
+
+    return {
+      ...ctx,
+      predictionSession: nextState,
+      sessionPersistenceDeferred: nextState.__persistenceDeferred,
+      sessionPersistenceReason: nextState.__persistenceDeferred
+        ? "prediction_session_persist_deferred"
+        : null,
+    };
   },
-  "Detaches prediction session persistence from the inquiry-critical path.",
+  "Queues the latest prediction session snapshot for durable persistence without blocking compute.",
 );
 
 const prepareHealthMetricInsertTask = Cadenza.createTask(
@@ -527,14 +948,14 @@ const finalizePredictionResponseTask = Cadenza.createTask(
 
 normalizePredictionInputTask.then(fetchWeatherTask);
 fetchWeatherTask.then(computePredictionTask);
-computePredictionTask.then(requestPredictionSessionPersistenceTask);
-requestPredictionSessionPersistenceTask.then(prepareHealthMetricInsertTask);
+computePredictionTask.then(preparePredictionSessionContextTask);
+preparePredictionSessionContextTask.then(persistPredictionSessionTask);
+persistPredictionSessionTask.then(persistPredictionSessionBestEffortTask);
+persistPredictionSessionBestEffortTask.then(prepareHealthMetricInsertTask);
 prepareHealthMetricInsertTask.then(persistHealthMetricTask);
 persistHealthMetricTask.then(emitPredictionSignalTask);
 emitPredictionSignalTask.then(finalizePredictionResponseTask);
 normalizePredictionInputTask.respondsTo(IOT_INTENTS.predictionCompute);
-
-persistPredictionSessionTask.doOn(PREDICTION_SESSION_PERSIST_SIGNAL);
 
 Cadenza.createTask(
   "Compute prediction from anomaly signal",
@@ -562,18 +983,37 @@ Cadenza.createTask(
   "Automatically computes prediction when anomaly-detected canonical signal is observed.",
 ).doOn(IOT_SIGNALS.anomalyDetected);
 
-Cadenza.createTask(
+const getPredictionSessionStateTask = Cadenza.createTask(
   "Get prediction session state",
   predictionSessionActor.task(
-    ({ actor, state }) => ({
-      __success: true,
-      actorKey: actor.key,
-      session: state,
-    }),
-    { mode: "read" },
+    ({ actor, input, state, setState }) => {
+      const nextState = state.__hydrated
+        ? state
+        : createPredictionSessionRuntimeState(
+            input.hydratedPredictionSessionState,
+            input.hydratedPredictionSessionState?.__durableVersion ?? 0,
+          );
+
+      if (!state.__hydrated && shouldTreatPredictionSessionAsHydrated(nextState)) {
+        hydratedPredictionSessionKeys.add(actor.key);
+        setState(nextState);
+      }
+
+      return {
+        __success: true,
+        actorKey: actor.key,
+        session: stripPredictionSessionRuntimeState(nextState),
+      };
+    },
+    { mode: "write" },
   ),
   "Returns persisted prediction actor session state by device key.",
-).respondsTo(IOT_INTENTS.predictionSessionGet);
+);
+
+preparePredictionSessionReadContextTask.then(
+  getPredictionSessionStateTask,
+);
+preparePredictionSessionReadContextTask.respondsTo(IOT_INTENTS.predictionSessionGet);
 
 Cadenza.createCadenzaService(
   "PredictorService",
