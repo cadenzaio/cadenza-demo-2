@@ -957,32 +957,6 @@ persistHealthMetricTask.then(emitPredictionSignalTask);
 emitPredictionSignalTask.then(finalizePredictionResponseTask);
 normalizePredictionInputTask.respondsTo(IOT_INTENTS.predictionCompute);
 
-Cadenza.createTask(
-  "Compute prediction from anomaly signal",
-  async (ctx: any, _emit: any, inquire: any) => {
-    const result = await inquire(
-      IOT_INTENTS.predictionCompute,
-      {
-        deviceId: ctx.deviceId,
-        timestamp: ctx.timestamp,
-        readings: ctx.readings,
-        anomalyResult: ctx,
-      },
-      {
-        requireComplete: true,
-        rejectOnTimeout: true,
-        timeout: 10000,
-      },
-    );
-
-    return {
-      __success: true,
-      prediction: result,
-    };
-  },
-  "Automatically computes prediction when anomaly-detected canonical signal is observed.",
-).doOn(IOT_SIGNALS.anomalyDetected);
-
 const getPredictionSessionStateTask = Cadenza.createTask(
   "Get prediction session state",
   predictionSessionActor.task(
