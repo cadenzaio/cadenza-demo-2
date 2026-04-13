@@ -17,6 +17,7 @@ const META_ACTOR_SESSION_STATE_PERSIST_INTENT = "meta-actor-session-state-persis
 const ALERT_SESSION_PERSIST_SIGNAL =
   "meta.demo.alert.session_persist_requested";
 const ALERT_SESSION_PERSIST_TIMEOUT_MS = 10_000;
+const ALERT_SESSION_FLUSH_DEBOUNCE_MS = 2_000;
 const ALERT_SESSION_RETRY_BASE_MS = 1_000;
 const ALERT_SESSION_RETRY_MAX_MS = 30_000;
 const ALERT_SESSION_ACTOR_NAME = "AlertSessionActor";
@@ -297,7 +298,7 @@ async function flushAlertSession(actorKey: string): Promise<void> {
       return;
     }
 
-    scheduleAlertSessionFlush(current, 0);
+    scheduleAlertSessionFlush(current, ALERT_SESSION_FLUSH_DEBOUNCE_MS);
   } catch (error) {
     const current = pendingAlertSessionFlushes.get(actorKey);
     if (!current) {
@@ -335,7 +336,7 @@ function queueAlertSessionFlush(
 
     if (!existing.inFlight) {
       existing.retryDelayMs = ALERT_SESSION_RETRY_BASE_MS;
-      scheduleAlertSessionFlush(existing, 0);
+      scheduleAlertSessionFlush(existing, ALERT_SESSION_FLUSH_DEBOUNCE_MS);
     }
   } else {
     const pending: PendingAlertSessionFlush = {
@@ -347,7 +348,7 @@ function queueAlertSessionFlush(
       timer: null,
     };
     pendingAlertSessionFlushes.set(actorKey, pending);
-    scheduleAlertSessionFlush(pending, 0);
+    scheduleAlertSessionFlush(pending, ALERT_SESSION_FLUSH_DEBOUNCE_MS);
   }
 
   return {

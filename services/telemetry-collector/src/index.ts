@@ -17,6 +17,7 @@ const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "telemetry-co
 const META_ACTOR_SESSION_STATE_HYDRATE_INTENT = "meta-actor-session-state-hydrate";
 const META_ACTOR_SESSION_STATE_PERSIST_INTENT = "meta-actor-session-state-persist";
 const TELEMETRY_SESSION_PERSIST_TIMEOUT_MS = 10_000;
+const TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS = 2_000;
 const TELEMETRY_SESSION_RETRY_BASE_MS = 1_000;
 const TELEMETRY_SESSION_RETRY_MAX_MS = 30_000;
 const TELEMETRY_SESSION_ACTOR_NAME = "TelemetrySessionActor";
@@ -377,7 +378,7 @@ async function flushTelemetrySession(deviceId: string): Promise<void> {
       return;
     }
 
-    scheduleTelemetrySessionFlush(current, 0);
+    scheduleTelemetrySessionFlush(current, TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS);
   } catch (error) {
     const current = pendingTelemetrySessionFlushes.get(deviceId);
     if (!current) {
@@ -415,7 +416,7 @@ function queueTelemetrySessionFlush(
 
     if (!existing.inFlight) {
       existing.retryDelayMs = TELEMETRY_SESSION_RETRY_BASE_MS;
-      scheduleTelemetrySessionFlush(existing, 0);
+      scheduleTelemetrySessionFlush(existing, TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS);
     }
   } else {
     const pending: PendingTelemetrySessionFlush = {
@@ -427,7 +428,7 @@ function queueTelemetrySessionFlush(
       timer: null,
     };
     pendingTelemetrySessionFlushes.set(deviceId, pending);
-    scheduleTelemetrySessionFlush(pending, 0);
+    scheduleTelemetrySessionFlush(pending, TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS);
   }
 
   return {

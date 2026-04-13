@@ -17,6 +17,7 @@ const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "predictor"}:
 const META_ACTOR_SESSION_STATE_HYDRATE_INTENT = "meta-actor-session-state-hydrate";
 const META_ACTOR_SESSION_STATE_PERSIST_INTENT = "meta-actor-session-state-persist";
 const PREDICTION_SESSION_PERSIST_TIMEOUT_MS = 10_000;
+const PREDICTION_SESSION_FLUSH_DEBOUNCE_MS = 2_000;
 const PREDICTION_SESSION_RETRY_BASE_MS = 1_000;
 const PREDICTION_SESSION_RETRY_MAX_MS = 30_000;
 const PREDICTION_SESSION_ACTOR_NAME = "PredictionSessionActor";
@@ -302,7 +303,7 @@ async function flushPredictionSession(deviceId: string): Promise<void> {
       return;
     }
 
-    schedulePredictionSessionFlush(current, 0);
+    schedulePredictionSessionFlush(current, PREDICTION_SESSION_FLUSH_DEBOUNCE_MS);
   } catch (error) {
     const current = pendingPredictionSessionFlushes.get(deviceId);
     if (!current) {
@@ -340,7 +341,7 @@ function queuePredictionSessionFlush(
 
     if (!existing.inFlight) {
       existing.retryDelayMs = PREDICTION_SESSION_RETRY_BASE_MS;
-      schedulePredictionSessionFlush(existing, 0);
+      schedulePredictionSessionFlush(existing, PREDICTION_SESSION_FLUSH_DEBOUNCE_MS);
     }
   } else {
     const pending: PendingPredictionSessionFlush = {
@@ -352,7 +353,7 @@ function queuePredictionSessionFlush(
       timer: null,
     };
     pendingPredictionSessionFlushes.set(deviceId, pending);
-    schedulePredictionSessionFlush(pending, 0);
+    schedulePredictionSessionFlush(pending, PREDICTION_SESSION_FLUSH_DEBOUNCE_MS);
   }
 
   return {
