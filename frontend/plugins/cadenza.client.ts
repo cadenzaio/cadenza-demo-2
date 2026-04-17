@@ -15,7 +15,7 @@ const setup = defineCadenzaNuxtRuntimePlugin({
     description: "Nuxt demo frontend browser runtime.",
     useSocket: true,
     cadenzaDB: {
-      connect: false,
+      connect: true,
     },
   },
   bootstrapUrl: (config) => String(config.public.cadenzaBootstrapUrl),

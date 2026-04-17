@@ -17,7 +17,7 @@ const internalOrigin = `http://${process.env.CADENZA_SERVER_URL ?? "telemetry-co
 const META_ACTOR_SESSION_STATE_HYDRATE_INTENT = "meta-actor-session-state-hydrate";
 const META_ACTOR_SESSION_STATE_PERSIST_INTENT = "meta-actor-session-state-persist";
 const TELEMETRY_SESSION_PERSIST_TIMEOUT_MS = 10_000;
-const TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS = 2_000;
+const TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS = 30_000;
 const TELEMETRY_SESSION_RETRY_BASE_MS = 1_000;
 const TELEMETRY_SESSION_RETRY_MAX_MS = 30_000;
 const TELEMETRY_SESSION_ACTOR_NAME = "TelemetrySessionActor";
@@ -48,8 +48,8 @@ type PendingTelemetrySessionFlush = {
   durableState: TelemetrySessionState;
   durableVersion: number;
   retryDelayMs: number;
+  nextAttemptAt: number;
   inFlight: boolean;
-  timer: ReturnType<typeof setTimeout> | null;
 };
 
 type CadenzaInquiry = (
@@ -65,6 +65,10 @@ const pendingTelemetrySessionHydrations = new Map<
 >();
 const pendingTelemetrySessionFlushes = new Map<string, PendingTelemetrySessionFlush>();
 let latestTelemetrySessionInquire: CadenzaInquiry | null = null;
+let telemetrySessionFlushTimer: ReturnType<typeof setTimeout> | null = null;
+let telemetrySessionFlushTimerDueAt = 0;
+let telemetrySessionFlushWorkerInFlight = false;
+let telemetrySessionFlushSuspendedUntil = 0;
 
 const telemetrySessionActor = Cadenza.createActor<TelemetrySessionRuntimeState>({
   name: "TelemetrySessionActor",
@@ -309,36 +313,90 @@ function isManagedTelemetrySessionPersistenceRecoveryError(error: unknown): bool
   );
 }
 
-function scheduleTelemetrySessionFlush(
-  pending: PendingTelemetrySessionFlush,
-  delayMs: number,
-): void {
-  if (pending.timer) {
-    clearTimeout(pending.timer);
+function scheduleTelemetrySessionFlushWorker(delayMs: number): void {
+  const dueAt = Date.now() + Math.max(0, delayMs);
+
+  if (
+    telemetrySessionFlushTimer &&
+    telemetrySessionFlushTimerDueAt > 0 &&
+    telemetrySessionFlushTimerDueAt <= dueAt
+  ) {
+    return;
   }
 
-  pending.timer = setTimeout(() => {
-    pending.timer = null;
-    void flushTelemetrySession(pending.deviceId);
-  }, delayMs);
-  pending.timer.unref?.();
+  if (telemetrySessionFlushTimer) {
+    clearTimeout(telemetrySessionFlushTimer);
+  }
+
+  telemetrySessionFlushTimerDueAt = dueAt;
+  telemetrySessionFlushTimer = setTimeout(() => {
+    telemetrySessionFlushTimer = null;
+    telemetrySessionFlushTimerDueAt = 0;
+    void flushNextTelemetrySession();
+  }, Math.max(0, dueAt - Date.now()));
+  telemetrySessionFlushTimer.unref?.();
 }
 
-async function flushTelemetrySession(deviceId: string): Promise<void> {
-  const pending = pendingTelemetrySessionFlushes.get(deviceId);
-  if (!pending || pending.inFlight) {
+function getNextPendingTelemetrySessionFlush(): PendingTelemetrySessionFlush | null {
+  let next: PendingTelemetrySessionFlush | null = null;
+
+  for (const pending of pendingTelemetrySessionFlushes.values()) {
+    if (pending.inFlight) {
+      continue;
+    }
+
+    if (!next || pending.nextAttemptAt < next.nextAttemptAt) {
+      next = pending;
+    }
+  }
+
+  return next;
+}
+
+function ensureTelemetrySessionFlushWorkerScheduled(): void {
+  if (telemetrySessionFlushWorkerInFlight) {
+    return;
+  }
+
+  const next = getNextPendingTelemetrySessionFlush();
+  if (!next) {
+    return;
+  }
+
+  const dueAt = Math.max(next.nextAttemptAt, telemetrySessionFlushSuspendedUntil);
+  scheduleTelemetrySessionFlushWorker(Math.max(0, dueAt - Date.now()));
+}
+
+async function flushNextTelemetrySession(): Promise<void> {
+  if (telemetrySessionFlushWorkerInFlight) {
+    return;
+  }
+
+  const nextPending = getNextPendingTelemetrySessionFlush();
+  if (!nextPending) {
+    return;
+  }
+
+  const now = Date.now();
+  const dueAt = Math.max(nextPending.nextAttemptAt, telemetrySessionFlushSuspendedUntil);
+  if (dueAt > now) {
+    scheduleTelemetrySessionFlushWorker(dueAt - now);
     return;
   }
 
   const inquire = latestTelemetrySessionInquire;
   if (!inquire) {
-    scheduleTelemetrySessionFlush(pending, pending.retryDelayMs);
+    nextPending.nextAttemptAt = Date.now() + TELEMETRY_SESSION_RETRY_BASE_MS;
+    ensureTelemetrySessionFlushWorkerScheduled();
     return;
   }
 
+  const pending = nextPending;
+  const deviceId = pending.deviceId;
   const snapshotVersion = pending.durableVersion;
   const snapshotState = pending.durableState;
   pending.inFlight = true;
+  telemetrySessionFlushWorkerInFlight = true;
 
   try {
     const result = await inquire(
@@ -378,7 +436,7 @@ async function flushTelemetrySession(deviceId: string): Promise<void> {
       return;
     }
 
-    scheduleTelemetrySessionFlush(current, TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS);
+    current.nextAttemptAt = Date.now() + TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS;
   } catch (error) {
     const current = pendingTelemetrySessionFlushes.get(deviceId);
     if (!current) {
@@ -395,7 +453,15 @@ async function flushTelemetrySession(deviceId: string): Promise<void> {
       current.retryDelayMs = TELEMETRY_SESSION_RETRY_MAX_MS;
     }
 
-    scheduleTelemetrySessionFlush(current, current.retryDelayMs);
+    current.nextAttemptAt = Date.now() + current.retryDelayMs;
+    telemetrySessionFlushSuspendedUntil = Math.max(
+      telemetrySessionFlushSuspendedUntil,
+      current.nextAttemptAt,
+    );
+  } finally {
+    pending.inFlight = false;
+    telemetrySessionFlushWorkerInFlight = false;
+    ensureTelemetrySessionFlushWorkerScheduled();
   }
 }
 
@@ -416,7 +482,7 @@ function queueTelemetrySessionFlush(
 
     if (!existing.inFlight) {
       existing.retryDelayMs = TELEMETRY_SESSION_RETRY_BASE_MS;
-      scheduleTelemetrySessionFlush(existing, TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS);
+      existing.nextAttemptAt = Date.now() + TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS;
     }
   } else {
     const pending: PendingTelemetrySessionFlush = {
@@ -425,11 +491,12 @@ function queueTelemetrySessionFlush(
       durableVersion,
       retryDelayMs: TELEMETRY_SESSION_RETRY_BASE_MS,
       inFlight: false,
-      timer: null,
+      nextAttemptAt: Date.now() + TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS,
     };
     pendingTelemetrySessionFlushes.set(deviceId, pending);
-    scheduleTelemetrySessionFlush(pending, TELEMETRY_SESSION_FLUSH_DEBOUNCE_MS);
   }
+
+  ensureTelemetrySessionFlushWorkerScheduled();
 
   return {
     ...state,

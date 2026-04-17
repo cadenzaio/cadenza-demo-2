@@ -8,8 +8,8 @@
     "build": "tsc"
   },
   "dependencies": {
-    "@cadenza.io/core": "^3.28.0",
-    "@cadenza.io/service": "^2.21.0",
+    "@cadenza.io/core": "^3.28.1",
+    "@cadenza.io/service": "^2.21.1",
     "typescript": "^5.6.3"
   },
   "devDependencies": {

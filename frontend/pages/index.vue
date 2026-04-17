@@ -7,6 +7,10 @@ const projectionState = useCadenzaProjectionState();
 const runtimeReady = useCadenzaRuntimeReady();
 let refreshIntervalId: number | null = null;
 
+const blockingError = computed(() => (!data.value ? error.value : null));
+const backgroundRefreshActive = computed(() => pending.value && !!data.value);
+const backgroundRefreshError = computed(() => (data.value ? error.value : null));
+
 if (import.meta.client) {
   watch(
     runtimeReady,
@@ -71,12 +75,18 @@ const runnerSummary = computed(() => {
         <span v-if="data?.recentAlerts?.[0]" class="hero-panel__badge">
           Latest alert {{ formatDisplayDate(data.recentAlerts[0].timestamp) }}
         </span>
+        <span v-if="backgroundRefreshActive" class="hero-panel__badge">
+          refreshing snapshot
+        </span>
+        <span v-else-if="backgroundRefreshError" class="hero-panel__badge">
+          snapshot refresh failed
+        </span>
       </div>
     </section>
 
-    <div v-if="pending" class="empty-state">Loading fleet snapshot...</div>
-    <div v-else-if="error" class="empty-state">
-      Failed to load the dashboard. {{ error.message }}
+    <div v-if="!data && pending" class="empty-state">Loading fleet snapshot...</div>
+    <div v-else-if="blockingError" class="empty-state">
+      Failed to load the dashboard. {{ blockingError.message }}
     </div>
     <template v-else-if="data">
       <div class="kpi-grid">
