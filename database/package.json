@@ -10,7 +10,7 @@
   "dependencies": {
     "@cadenza.io/cadenza-db": "^2.12.2",
     "@cadenza.io/core": "^3.28.1",
-    "@cadenza.io/service": "^2.21.1",
+    "@cadenza.io/service": "^2.21.4",
     "typescript": "^5.3.3"
   },
   "devDependencies": {

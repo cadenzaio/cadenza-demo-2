@@ -9,7 +9,7 @@
   },
   "dependencies": {
     "@cadenza.io/core": "^3.28.1",
-    "@cadenza.io/service": "^2.21.1",
+    "@cadenza.io/service": "^2.21.4",
     "typescript": "^5.6.3"
   },
   "devDependencies": {
