@@ -1,5 +1,8 @@
 # cadenza-demo-2
 
+> [!WARNING]
+> **Legacy pre-v4 Cadenza implementation.** This repository does not define the current Cadenza architecture or contracts. No compatibility with the new major-version direction is promised. See [cadenza-workspace](https://github.com/cadenzaio/cadenza-workspace) for the current architecture and releases.
+
 IoT demo stack for generating realistic distributed runtime metadata and data flows in Cadenza.
 
 Additional reading:
